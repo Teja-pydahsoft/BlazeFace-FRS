@@ -39,12 +39,19 @@ class AttendanceMarkingDialog:
         self.pipeline = None
         self.face_embedder = None
         
+        # Detect camera type for pipeline optimization
+        self.camera_type = self._detect_camera_type(camera_source)
+        
         # UI state
         self.is_running = False
         self.current_frame = None
         self.recognized_students = {}  # student_id -> (name, last_seen, confidence)
         self.attendance_marked = set()  # Set of student_ids already marked today
         self.student_names = {}  # Cache student names for quick lookup
+        
+        # Recognition consistency tracking
+        self.last_recognition_result = None  # (student_id, confidence, timestamp)
+        self.recognition_consistency_threshold = 0.05  # 5% variation allowed
         
         # Create dialog window
         self.dialog = tk.Toplevel(parent)
@@ -73,6 +80,21 @@ class AttendanceMarkingDialog:
         
         # Center dialog
         self._center_dialog()
+    
+    def _detect_camera_type(self, camera_source: str) -> str:
+        """Detect camera type for pipeline optimization"""
+        try:
+            if isinstance(camera_source, int) or str(camera_source).isdigit():
+                return "webcam"
+            elif str(camera_source).startswith(("rtsp://", "http://", "https://")):
+                return "stream"
+            elif str(camera_source).endswith((".mp4", ".avi", ".mov", ".mkv")):
+                return "video_file"
+            else:
+                return "webcam"
+        except Exception as e:
+            print(f"Error detecting camera type: {e}")
+            return "webcam"
     
     def _setup_ui(self):
         """Setup the attendance marking UI"""
@@ -113,8 +135,8 @@ class AttendanceMarkingDialog:
         
         # Recognition threshold (for face embedding similarity matching)
         ttk.Label(settings_frame, text="Recognition Threshold (face similarity):").pack(anchor=tk.W)
-        self.threshold_var = tk.DoubleVar(value=self.config.get('recognition_confidence', 0.85))
-        threshold_scale = ttk.Scale(settings_frame, from_=0.7, to=1.0, 
+        self.threshold_var = tk.DoubleVar(value=self.config.get('recognition_confidence', 0.80))
+        threshold_scale = ttk.Scale(settings_frame, from_=0.6, to=1.0, 
                                   variable=self.threshold_var, orient=tk.HORIZONTAL)
         threshold_scale.pack(fill=tk.X, pady=(0, 5))
         
@@ -139,7 +161,7 @@ class AttendanceMarkingDialog:
         
         # Face detection confidence threshold (for filtering detected faces)
         ttk.Label(settings_frame, text="Min Face Detection Confidence (filter faces):").pack(anchor=tk.W)
-        self.face_confidence_var = tk.DoubleVar(value=0.3)  # Lower default threshold to detect more faces
+        self.face_confidence_var = tk.DoubleVar(value=0.1)  # Very low threshold to detect more faces
         face_confidence_scale = ttk.Scale(settings_frame, from_=0.1, to=1.0, 
                                         variable=self.face_confidence_var, orient=tk.HORIZONTAL)
         face_confidence_scale.pack(fill=tk.X, pady=(0, 5))
@@ -300,8 +322,24 @@ class AttendanceMarkingDialog:
             # Add records to treeview
             for record in records:
                 status = "Present" if record['status'] == 'present' else record['status'].title()
-                time_str = f"{record['time']}" if record['time'] else "N/A"
-                confidence = f"{record['confidence']:.2f}" if record['confidence'] else "N/A"
+                # Fix the time formatting issue - ensure time is properly converted to string
+                time_str = str(record['time']) if record['time'] else "N/A"
+                
+                # Handle confidence field - it might be stored as bytes or float
+                confidence = "N/A"
+                if record['confidence'] is not None:
+                    try:
+                        if isinstance(record['confidence'], bytes):
+                            # Convert bytes to float
+                            import struct
+                            confidence_val = struct.unpack('f', record['confidence'])[0]
+                            confidence = f"{confidence_val:.2f}"
+                        else:
+                            # Already a float
+                            confidence = f"{record['confidence']:.2f}"
+                    except Exception as e:
+                        print(f"Error processing confidence value: {e}")
+                        confidence = "N/A"
                 
                 self.attendance_tree.insert('', 'end', values=(
                     record['student_id'],
@@ -316,6 +354,8 @@ class AttendanceMarkingDialog:
             
         except Exception as e:
             print(f"Error loading today's attendance: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _start_camera_preview(self):
         """Start camera preview"""
@@ -331,16 +371,54 @@ class AttendanceMarkingDialog:
             self.status_label.config(text=f"Status: Error - {str(e)}", foreground='red')
     
     def _update_camera_preview(self):
-        """Update camera preview"""
+        """Update camera preview with performance optimizations"""
         try:
             if self.camera_manager.is_camera_available():
                 ret, frame = self.camera_manager.get_frame()
                 if ret and frame is not None:
+                    # Performance optimization: Skip frames for recognition processing
+                    if not hasattr(self, '_frame_skip_counter'):
+                        self._frame_skip_counter = 0
+                    if not hasattr(self, '_last_recognition_time'):
+                        self._last_recognition_time = 0
+                    
+                    self._frame_skip_counter += 1
+                    current_time = time.time()
+                    
                     # Process frame through pipeline if running
                     if self.is_running and self.pipeline:
-                        results = self.pipeline.process_frame(frame)
-                        frame = self._draw_enhanced_detections(frame, results)
-                        self._process_recognition_results(results)
+                        # Only process every few frames for better performance
+                        if self._frame_skip_counter % 3 == 0:  # Process every 3rd frame
+                            results = self.pipeline.process_frame(frame)
+                            
+                            # Debug: Log detection results
+                            faces_detected = len(results.get('faces', []))
+                            if faces_detected > 0:
+                                print(f"Detection: Found {faces_detected} faces")
+                                for i, face in enumerate(results.get('faces', [])):
+                                    x, y, w, h, conf = face
+                                    print(f"  Face {i}: bbox=({x},{y},{w},{h}), confidence={conf:.3f}")
+                            else:
+                                print("No faces detected in current frame")
+                            
+                            frame = self._draw_enhanced_detections(frame, results)
+                        
+                        # Only do recognition processing at intervals
+                        if current_time - self._last_recognition_time > 0.5:  # 0.5 second intervals
+                            self._process_recognition_results(results)
+                            self._last_recognition_time = current_time
+                        else:
+                            # Just draw existing detections without processing
+                            frame = self._draw_enhanced_detections(frame, {'faces': [], 'embeddings': []})
+                    elif self.is_running and self.camera_type == 'stream':
+                        # Fallback: Direct face detection for NVR cameras if pipeline fails
+                        if self._frame_skip_counter % 5 == 0:  # Even less frequent for fallback
+                            faces = self.face_detector.detect_faces(frame)
+                            if faces:
+                                print(f"Direct NVR detection: Found {len(faces)} faces")
+                            
+                            # Draw faces directly
+                            frame = self.face_detector.draw_faces(frame, faces)
                     
                     # Resize frame for display
                     display_frame = cv2.resize(frame, (500, 400))
@@ -356,11 +434,42 @@ class AttendanceMarkingDialog:
                     
                     self.current_frame = frame
                 else:
-                    self.camera_label.config(text="No camera feed")
-                    self.status_label.config(text="Status: No camera feed", foreground='red')
+                    # Only show "No camera feed" if we've been trying for a while
+                    if not hasattr(self, '_no_feed_count'):
+                        self._no_feed_count = 0
+                    self._no_feed_count += 1
+                    
+                    if self._no_feed_count > 15:  # Increased threshold for more stability
+                        self.camera_label.config(text="No camera feed")
+                        self.status_label.config(text="Status: No camera feed", foreground='red')
+            else:
+                # Camera not available, try to reinitialize much less frequently
+                if not hasattr(self, '_reinit_count'):
+                    self._reinit_count = 0
+                if not hasattr(self, '_last_reinit_time'):
+                    self._last_reinit_time = 0
+                
+                current_time = time.time()
+                self._reinit_count += 1
+                
+                # Only try to reinitialize every 60 seconds and after 30 failed attempts
+                if (self._reinit_count > 30 and 
+                    current_time - self._last_reinit_time > 60):
+                    print("Camera not available, attempting to reinitialize...")
+                    try:
+                        self.camera_manager.release()
+                        camera_source = self.config.get('camera_sources', {}).get('webcam', self.config.get('camera_index', 0))
+                        from ..utils.camera_utils import CameraManager
+                        self.camera_manager = CameraManager(camera_source)
+                        self._reinit_count = 0
+                        self._last_reinit_time = current_time
+                    except Exception as e:
+                        print(f"Failed to reinitialize camera: {e}")
+                        self._last_reinit_time = current_time
             
-            # Schedule next update
-            self.dialog.after(30, self._update_camera_preview)
+            # Schedule next update with adaptive timing
+            update_interval = 30 if self.is_running else 50  # Faster when running, slower when idle
+            self.dialog.after(update_interval, self._update_camera_preview)
             
         except Exception as e:
             print(f"Error updating camera preview: {e}")
@@ -530,10 +639,10 @@ class AttendanceMarkingDialog:
             
             # Get recognition threshold from config or UI
             ui_threshold = self.threshold_var.get()
-            config_threshold = self.config.get('recognition_confidence', 0.90)
+            config_threshold = self.config.get('recognition_confidence', 0.80)
             
-            # Use strict threshold to prevent false positives
-            recognition_threshold = max(ui_threshold, config_threshold, 0.85)  # Raised to 0.85 to prevent false matches
+            # Use balanced threshold for better performance - CONSISTENT THRESHOLD
+            recognition_threshold = max(ui_threshold, config_threshold, 0.75)  # Lowered minimum to 0.75
             
             print(f"Using UI threshold: {ui_threshold:.2f}, config threshold: {config_threshold:.2f}, final threshold: {recognition_threshold:.2f}")
             print(f"Comparing against {len(self.student_encodings)} students")
@@ -557,8 +666,8 @@ class AttendanceMarkingDialog:
                 
                 print(f"  Student {student_id} max similarity: {student_max_similarity:.4f}")
                 
-                # Only consider as match if similarity is significantly above recognition threshold
-                if student_max_similarity > recognition_threshold and student_max_similarity > best_similarity:
+                # Track the best match regardless of threshold (threshold check happens later)
+                if student_max_similarity > best_similarity:
                     best_similarity = student_max_similarity
                     best_student_id = student_id
                     print(f"  -> New best match: {student_id} with similarity {student_max_similarity:.4f}")
@@ -570,36 +679,61 @@ class AttendanceMarkingDialog:
             
             print(f"Final result: best_similarity={best_similarity:.4f}, best_student_id={best_student_id}")
             
-            # Additional quality check: Ensure the best match is significantly better than others
-            if best_similarity > recognition_threshold:
-                # Check if this is a clear winner (much better than second best)
+            # QUALITY CHECK: Accept matches above threshold, or best match if no one meets threshold
+            if best_similarity >= recognition_threshold:
+                # Additional check: Ensure this is a clear, unambiguous match
                 second_best = 0.0
                 for student_id, enc_idx, sim in sorted(all_similarities, key=lambda x: x[2], reverse=True)[1:3]:
                     if sim > second_best:
                         second_best = sim
                 
-                # Require configurable difference between best and second best
-                min_gap = self.config.get('min_confidence_gap', 0.02)
+                # Calculate gap between best and second best
+                gap = best_similarity - second_best
+                min_gap = self.config.get('min_confidence_gap', 0.01)  # Reduced from 0.02 to 0.01
                 
-                # Special case: If there's only one student in database, still require high confidence
-                if len(self.student_encodings) == 1:
-                    if best_similarity >= 0.85:  # Still require high confidence even for single student
-                        print(f"✓ SINGLE STUDENT MATCH: {best_student_id} with similarity {best_similarity:.4f} (only student in database)")
-                        return best_student_id, best_similarity
-                    else:
-                        print(f"✗ SINGLE STUDENT REJECTED: {best_similarity:.4f} below 0.85 threshold for single student")
-                        return None
-                elif best_similarity - second_best >= min_gap:
-                    print(f"✓ CLEAR MATCH FOUND: {best_student_id} with similarity {best_similarity:.4f} (gap: {best_similarity - second_best:.4f})")
+                # BALANCED LOGIC: Require good confidence with reasonable gap
+                if best_similarity >= recognition_threshold and gap >= min_gap:
+                    # Additional consistency check: Compare with last recognition result
+                    current_time = time.time()
+                    if self.last_recognition_result:
+                        last_student_id, last_confidence, last_time = self.last_recognition_result
+                        time_diff = current_time - last_time
+                        
+                        # If recognition happened recently (within 1 second) and results are inconsistent
+                        if time_diff < 1.0:  # Reduced from 2.0 to 1.0 seconds
+                            if last_student_id != best_student_id:
+                                # Only reject if confidence difference is very large (similar students can have close scores)
+                                confidence_diff = abs(best_similarity - last_confidence)
+                                if confidence_diff > 0.1:  # Only reject if difference > 0.1
+                                    print(f"⚠️  INCONSISTENT RECOGNITION: Last result was {last_student_id} ({last_confidence:.4f}), now {best_student_id} ({best_similarity:.4f})")
+                                    print(f"⚠️  REJECTING INCONSISTENT MATCH - This face will be marked as UNKNOWN")
+                                    return None
+                                else:
+                                    print(f"ℹ️  SIMILAR STUDENTS: Switching from {last_student_id} to {best_student_id} (diff: {confidence_diff:.4f})")
+                            elif abs(best_similarity - last_confidence) > self.recognition_consistency_threshold:
+                                print(f"⚠️  CONFIDENCE VARIATION: Last {last_confidence:.4f}, now {best_similarity:.4f} (diff: {abs(best_similarity - last_confidence):.4f})")
+                                print(f"⚠️  REJECTING VARIABLE MATCH - This face will be marked as UNKNOWN")
+                                return None
+                    
+                    # Store this recognition result for consistency checking
+                    self.last_recognition_result = (best_student_id, best_similarity, current_time)
+                    
+                    print(f"✓ CLEAR MATCH FOUND: {best_student_id} with similarity {best_similarity:.4f} (gap: {gap:.4f})")
                     return best_student_id, best_similarity
                 else:
-                    print(f"✗ AMBIGUOUS MATCH: Best similarity {best_similarity:.4f} too close to second best {second_best:.4f}")
-                    print(f"✗ AMBIGUOUS MATCH: This face will be marked as UNKNOWN")
+                    print(f"✗ INSUFFICIENT CONFIDENCE: {best_similarity:.4f} < {recognition_threshold:.2f} OR gap {gap:.4f} < {min_gap:.3f}")
+                    print(f"✗ REJECTING MATCH - This face will be marked as UNKNOWN")
                     return None
             else:
-                print(f"✗ NO MATCH: Best similarity {best_similarity:.4f} below recognition threshold {recognition_threshold:.2f}")
-                print(f"✗ NO MATCH: This face will be marked as UNKNOWN")
-                return None
+                # Fallback: If best match is below threshold but still reasonable, accept it with lower confidence
+                if best_similarity >= 0.70:  # Lower threshold for fallback
+                    print(f"⚠️  FALLBACK MATCH: Best similarity {best_similarity:.4f} below threshold {recognition_threshold:.2f} but above 0.70")
+                    print(f"⚠️  ACCEPTING FALLBACK MATCH: {best_student_id} with similarity {best_similarity:.4f}")
+                    return best_student_id, best_similarity
+                else:
+                    print(f"✗ NO MATCH: Best similarity {best_similarity:.4f} below recognition threshold {recognition_threshold:.2f}")
+                    print(f"✗ NO MATCH: This face will be marked as UNKNOWN")
+                    return None
             
         except Exception as e:
             print(f"Error finding best match: {e}")
@@ -631,9 +765,12 @@ class AttendanceMarkingDialog:
             from ..utils.camera_utils import CameraManager
             self.camera_manager = CameraManager(camera_source)
             
+            # Update camera type
+            self.camera_type = self._detect_camera_type(camera_source)
+            
             if self.camera_manager.is_initialized:
-                messagebox.showinfo("Success", f"Switched to {selected_source} camera")
-                print(f"Switched to camera: {camera_source}")
+                messagebox.showinfo("Success", f"Switched to {selected_source} camera ({self.camera_type})")
+                print(f"Switched to camera: {camera_source} (type: {self.camera_type})")
             else:
                 messagebox.showerror("Error", f"Failed to initialize {selected_source} camera")
                 print(f"Failed to initialize camera: {camera_source}")
@@ -741,8 +878,10 @@ class AttendanceMarkingDialog:
             if self.is_running:
                 return
             
-            # Initialize pipeline
-            self.pipeline = DualPipeline(self.config)
+            # Initialize pipeline with camera type
+            pipeline_config = self.config.copy()
+            pipeline_config['camera_type'] = self.camera_type
+            self.pipeline = DualPipeline(pipeline_config)
             self.pipeline.start_pipeline()
             
             self.is_running = True

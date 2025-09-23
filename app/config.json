@@ -9,9 +9,9 @@
         "ip_camera": "http://192.168.3.235:8080/video",
         "video_file": "test_video.mp4"
     },
-    "detection_confidence": 0.3,
-    "recognition_confidence": 0.85,
-    "min_confidence_gap": 0.02,
+    "detection_confidence": 0.1,
+    "recognition_confidence": 0.75,
+    "min_confidence_gap": 0.0001,
     "blazeface_model_path": "models/blazeface_640x640.tflite",
     "facenet_model_path": "models/facenet_keras.h5",
     "human_detection_model_path": "models/mobilenet_ssd.tflite",
@@ -19,5 +19,19 @@
     "face_encoding_dimension": 128,
     "attendance_timeout": 30,
     "ui_theme": "light",
-    "log_level": "INFO"
+    "log_level": "INFO",
+    "performance_settings": {
+        "enable_fast_mode": true,
+        "skip_frames": 2,
+        "max_processing_fps": 15,
+        "buffer_size": 3,
+        "recognition_interval": 0.5
+    },
+    "nvr_settings": {
+        "detection_confidence": 0.05,
+        "frame_width": 1280,
+        "frame_height": 720,
+        "buffer_size": 1,
+        "timeout_ms": 10000
+    }
 }

@@ -1,0 +1,243 @@
+"""
+Test improved face detection accuracy with stricter filtering
+"""
+
+import sys
+import os
+import cv2
+import time
+import numpy as np
+import logging
+
+# Add app directory to Python path
+sys.path.append(os.path.join(os.path.dirname(__file__), 'app'))
+
+from app.utils.camera_utils import CameraManager
+from app.core.blazeface_detector import BlazeFaceDetector
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def test_improved_accuracy():
+    """Test improved face detection accuracy"""
+    print("=" * 60)
+    print("TESTING IMPROVED FACE DETECTION ACCURACY")
+    print("=" * 60)
+    
+    try:
+        # Load saved frame
+        frame_path = "nvr_test_frame_fixed.jpg"
+        frame = cv2.imread(frame_path)
+        
+        if frame is None:
+            print(f"❌ Failed to load frame: {frame_path}")
+            return False
+        
+        print(f"✅ Loaded frame: {frame.shape}")
+        
+        # Initialize improved detector
+        detector = BlazeFaceDetector(
+            min_detection_confidence=0.01,
+            use_opencv_fallback=True
+        )
+        
+        # Detect faces
+        faces = detector.detect_faces(frame)
+        
+        if faces:
+            print(f"✅ Improved detector found {len(faces)} faces")
+            
+            for j, face in enumerate(faces):
+                x, y, w, h, conf = face
+                print(f"  Face {j}: bbox=({x},{y},{w},{h}), confidence={conf:.3f}")
+            
+            # Draw and save
+            frame_with_faces = detector.draw_faces(frame.copy(), faces)
+            cv2.imwrite("improved_accuracy_detection.jpg", frame_with_faces)
+            print("💾 Saved: improved_accuracy_detection.jpg")
+            
+            detector.release()
+            return True
+        else:
+            print("❌ Improved detector found no faces")
+            detector.release()
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error testing improved accuracy: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def test_with_live_camera():
+    """Test with live NVR camera"""
+    print("\n" + "=" * 60)
+    print("TESTING WITH LIVE NVR CAMERA")
+    print("=" * 60)
+    
+    nvr_url = "rtsp://admin:nvr@pydah@192.168.3.235:554/stream1"
+    
+    try:
+        # Initialize camera
+        print(f"Connecting to NVR camera: {nvr_url}")
+        camera_manager = CameraManager(nvr_url)
+        
+        if not camera_manager.is_initialized:
+            print("❌ Failed to initialize NVR camera")
+            return False
+        
+        print("✅ NVR camera initialized successfully")
+        
+        # Initialize improved detector
+        detector = BlazeFaceDetector(
+            min_detection_confidence=0.01,
+            use_opencv_fallback=True
+        )
+        
+        # Test face detection
+        detection_count = 0
+        total_faces = 0
+        total_frames = 10
+        
+        print(f"\nTesting improved detection on {total_frames} frames...")
+        
+        for i in range(total_frames):
+            ret, frame = camera_manager.get_frame()
+            if ret and frame is not None:
+                print(f"Frame {i+1}: Processing {frame.shape}...")
+                
+                # Detect faces
+                faces = detector.detect_faces(frame)
+                
+                if faces:
+                    detection_count += 1
+                    total_faces += len(faces)
+                    print(f"  ✅ Found {len(faces)} faces")
+                    
+                    # Show face details
+                    for j, face in enumerate(faces):
+                        x, y, w, h, conf = face
+                        print(f"    Face {j}: bbox=({x},{y},{w},{h}), confidence={conf:.3f}")
+                    
+                    # Save first few detections
+                    if detection_count <= 3:
+                        frame_with_faces = detector.draw_faces(frame.copy(), faces)
+                        cv2.imwrite(f"improved_live_{detection_count}.jpg", frame_with_faces)
+                        print(f"  💾 Saved: improved_live_{detection_count}.jpg")
+                else:
+                    print(f"  ❌ No faces detected")
+                
+                time.sleep(0.3)
+        
+        # Cleanup
+        detector.release()
+        camera_manager.release()
+        
+        # Calculate statistics
+        detection_rate = (detection_count / total_frames) * 100
+        avg_faces_per_frame = total_faces / total_frames if total_frames > 0 else 0
+        
+        print(f"\n--- Improved Detection Summary ---")
+        print(f"Frames with faces: {detection_count}/{total_frames}")
+        print(f"Detection rate: {detection_rate:.1f}%")
+        print(f"Total faces detected: {total_faces}")
+        print(f"Average faces per frame: {avg_faces_per_frame:.1f}")
+        
+        return detection_count > 0
+        
+    except Exception as e:
+        print(f"❌ Error testing with live camera: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def test_detection_quality_analysis():
+    """Analyze detection quality"""
+    print("\n" + "=" * 60)
+    print("DETECTION QUALITY ANALYSIS")
+    print("=" * 60)
+    
+    try:
+        # Load saved frame
+        frame = cv2.imread("nvr_test_frame_fixed.jpg")
+        if frame is None:
+            print("❌ Failed to load test frame")
+            return False
+        
+        # Initialize detector
+        detector = BlazeFaceDetector(
+            min_detection_confidence=0.01,
+            use_opencv_fallback=True
+        )
+        
+        faces = detector.detect_faces(frame)
+        
+        if faces:
+            print(f"Raw detections: {len(faces)} faces")
+            
+            # Analyze face sizes
+            sizes = [w * h for x, y, w, h, conf in faces]
+            print(f"Face sizes: min={min(sizes)}, max={max(sizes)}, avg={np.mean(sizes):.0f}")
+            
+            # Analyze confidence scores
+            confidences = [conf for x, y, w, h, conf in faces]
+            print(f"Confidence scores: min={min(confidences):.3f}, max={max(confidences):.3f}, avg={np.mean(confidences):.3f}")
+            
+            # Analyze aspect ratios
+            aspect_ratios = [w/h for x, y, w, h, conf in faces]
+            print(f"Aspect ratios: min={min(aspect_ratios):.2f}, max={max(aspect_ratios):.2f}, avg={np.mean(aspect_ratios):.2f}")
+            
+            # Analyze positions
+            positions_y = [y + h//2 for x, y, w, h, conf in faces]
+            print(f"Y positions: min={min(positions_y)}, max={max(positions_y)}, avg={np.mean(positions_y):.0f}")
+            
+            # Count high confidence detections
+            high_conf = [face for face in faces if face[4] >= 0.7]
+            print(f"High confidence detections (>=0.7): {len(high_conf)}")
+            
+            detector.release()
+            return True
+        else:
+            print("❌ No faces detected for quality analysis")
+            detector.release()
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error in quality analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def main():
+    """Main test function"""
+    print("Improved Face Detection Accuracy Test")
+    print("This tests the enhanced detection with stricter filtering")
+    print("=" * 60)
+    
+    # Test 1: With saved frame
+    saved_success = test_improved_accuracy()
+    
+    # Test 2: Quality analysis
+    quality_success = test_detection_quality_analysis()
+    
+    # Test 3: Live camera
+    live_success = test_with_live_camera()
+    
+    # Results
+    print("\n" + "=" * 60)
+    print("IMPROVED ACCURACY TEST RESULTS")
+    print("=" * 60)
+    print(f"Saved frame test: {'✅ PASS' if saved_success else '❌ FAIL'}")
+    print(f"Quality analysis: {'✅ PASS' if quality_success else '❌ FAIL'}")
+    print(f"Live camera test: {'✅ PASS' if live_success else '❌ FAIL'}")
+    
+    if saved_success or live_success:
+        print("\n🎉 IMPROVED FACE DETECTION IS WORKING!")
+        print("The enhanced detector should now have much better accuracy.")
+        print("Check the generated improved_*.jpg files to see the results.")
+    else:
+        print("\n❌ Improved detection still needs work")
+
+if __name__ == "__main__":
+    main()

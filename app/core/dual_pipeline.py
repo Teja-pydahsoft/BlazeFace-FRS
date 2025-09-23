@@ -34,8 +34,10 @@ class DualPipeline:
         self.logger = logging.getLogger(__name__)
         
         # Initialize detectors
+        # Use very low confidence threshold for NVR cameras
+        detection_conf = config.get('detection_confidence', 0.1) if config.get('camera_type') == 'stream' else config.get('detection_confidence', 0.3)
         self.face_detector = face_detector or BlazeFaceDetector(
-            min_detection_confidence=config.get('detection_confidence', 0.3)  # Lower threshold for better detection
+            min_detection_confidence=detection_conf
         )
         self.human_detector = human_detector or HumanDetector(
             confidence_threshold=config.get('detection_confidence', 0.7)
@@ -124,7 +126,7 @@ class DualPipeline:
     
     def process_frame(self, frame: np.ndarray) -> Dict[str, Any]:
         """
-        Process a single frame through both pipelines
+        Process a single frame through both pipelines with performance optimizations
         
         Args:
             frame: Input image frame
@@ -136,9 +138,37 @@ class DualPipeline:
             if not self.is_running or self.is_paused:
                 return self._get_empty_result()
             
-            # Add frame to processing queues
+            # Performance optimization: Skip processing if too frequent
+            current_time = time.time()
+            if not hasattr(self, '_last_process_time'):
+                self._last_process_time = 0
+            
+            # Limit processing frequency for better performance
+            max_fps = self.config.get('performance_settings', {}).get('max_processing_fps', 15)
+            min_interval = 1.0 / max_fps if max_fps > 0 else 0.1
+            
+            if current_time - self._last_process_time < min_interval:
+                # Return cached results if processing too frequently
+                with self.lock:
+                    return {
+                        'faces': self.current_faces.copy(),
+                        'humans': self.current_humans.copy(),
+                        'embeddings': self.current_embeddings.copy(),
+                        'timestamp': current_time,
+                        'frame_shape': frame.shape
+                    }
+            
+            self._last_process_time = current_time
+            
+            # For NVR cameras and streams, use direct processing for better reliability
+            if hasattr(self, 'config') and self.config.get('camera_type') == 'stream':
+                return self._process_frame_direct(frame)
+            
+            # Add frame to processing queues for webcam (with size limit)
             if not self.face_queue.full():
-                self.face_queue.put(frame.copy())
+                # Resize frame for faster processing
+                small_frame = cv2.resize(frame, (640, 480)) if frame.shape[1] > 640 else frame
+                self.face_queue.put(small_frame.copy())
             if not self.human_queue.full():
                 self.human_queue.put(frame.copy())
             
@@ -148,7 +178,7 @@ class DualPipeline:
                     'faces': self.current_faces.copy(),
                     'humans': self.current_humans.copy(),
                     'embeddings': self.current_embeddings.copy(),
-                    'timestamp': time.time(),
+                    'timestamp': current_time,
                     'frame_shape': frame.shape
                 }
             
@@ -156,6 +186,68 @@ class DualPipeline:
             
         except Exception as e:
             self.logger.error(f"Error processing frame: {str(e)}")
+            return self._get_empty_result()
+    
+    def _process_frame_direct(self, frame: np.ndarray) -> Dict[str, Any]:
+        """
+        Process frame directly without threading (for NVR cameras)
+        
+        Args:
+            frame: Input image frame
+            
+        Returns:
+            Dictionary containing detection results
+        """
+        try:
+            # Detect faces directly
+            faces = self.face_detector.detect_faces(frame)
+            
+            # Debug face detection
+            if faces:
+                self.logger.debug(f"Direct detection: Found {len(faces)} faces")
+                for i, face in enumerate(faces):
+                    x, y, w, h, conf = face
+                    self.logger.debug(f"  Face {i}: bbox=({x},{y},{w},{h}), confidence={conf:.3f}")
+            else:
+                self.logger.debug("Direct detection: No faces found")
+            
+            # Get face embeddings
+            embeddings = []
+            for i, face_box in enumerate(faces):
+                x, y, w, h, confidence = face_box
+                face_region = self.face_detector.extract_face_region(frame, (x, y, w, h))
+                if face_region is not None:
+                    embedding = self.face_embedder.get_embedding(face_region)
+                    if embedding is not None:
+                        embeddings.append(embedding)
+                        self.logger.debug(f"Direct embedding: Face {i} got embedding with shape {embedding.shape}")
+                    else:
+                        self.logger.debug(f"Direct embedding: Face {i} failed to get embedding")
+                        embeddings.append(None)
+                else:
+                    self.logger.debug(f"Direct embedding: Face {i} failed to extract face region")
+                    embeddings.append(None)
+            
+            # Detect humans
+            humans = self.human_detector.detect_humans(frame)
+            
+            # Update results
+            with self.lock:
+                self.current_faces = faces
+                self.current_humans = humans
+                self.current_embeddings = embeddings
+                self.last_update_time = time.time()
+            
+            return {
+                'faces': faces,
+                'humans': humans,
+                'embeddings': embeddings,
+                'timestamp': time.time(),
+                'frame_shape': frame.shape
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error in direct frame processing: {str(e)}")
             return self._get_empty_result()
     
     def _face_detection_worker(self):

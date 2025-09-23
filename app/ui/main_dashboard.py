@@ -241,7 +241,7 @@ class MainDashboard:
         try:
             if self.camera_manager.is_camera_available():
                 ret, frame = self.camera_manager.get_frame()
-                if ret:
+                if ret and frame is not None:
                     # Process frame through pipeline if running
                     if self.is_running and self.pipeline:
                         results = self.pipeline.process_frame(frame)
@@ -259,6 +259,38 @@ class MainDashboard:
                     
                     # Update statistics
                     self._update_statistics()
+                else:
+                    # Only show "No camera feed" if we've been trying for a while
+                    if not hasattr(self, '_no_feed_count'):
+                        self._no_feed_count = 0
+                    self._no_feed_count += 1
+                    
+                    if self._no_feed_count > 10:  # Show error after 10 failed attempts
+                        self.camera_label.config(text="No camera feed")
+            else:
+                # Camera not available, try to reinitialize much less frequently
+                if not hasattr(self, '_reinit_count'):
+                    self._reinit_count = 0
+                if not hasattr(self, '_last_reinit_time'):
+                    self._last_reinit_time = 0
+                
+                current_time = time.time()
+                self._reinit_count += 1
+                
+                # Only try to reinitialize every 60 seconds and after 30 failed attempts
+                if (self._reinit_count > 30 and 
+                    current_time - self._last_reinit_time > 60):
+                    print("Camera not available, attempting to reinitialize...")
+                    try:
+                        self.camera_manager.release()
+                        camera_source = self.config.get('camera_sources', {}).get('webcam', self.config.get('camera_index', 0))
+                        from ..utils.camera_utils import CameraManager
+                        self.camera_manager = CameraManager(camera_source)
+                        self._reinit_count = 0
+                        self._last_reinit_time = current_time
+                    except Exception as e:
+                        print(f"Failed to reinitialize camera: {e}")
+                        self._last_reinit_time = current_time
             
             # Schedule next update
             self.root.after(30, self._update_camera_preview)

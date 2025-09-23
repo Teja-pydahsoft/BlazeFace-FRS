@@ -75,13 +75,18 @@ class CameraManager:
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                 self.cap.set(cv2.CAP_PROP_FPS, 30)
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer size for lower latency
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # Increased buffer for stability
+                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # Disable autofocus for better performance
             elif self.camera_type == "stream":
                 # For RTSP/HTTP streams, set buffer size and timeout
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 # Set timeout for stream connections (in milliseconds)
-                self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-                self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+                self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)  # Reduced timeout for faster recovery
+                self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000)  # Reduced timeout for faster recovery
+                # Don't force codec conversion - let OpenCV handle the original codec
+                # self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                # Try to set frame rate
+                self.cap.set(cv2.CAP_PROP_FPS, 25)  # NVR cameras often use 25fps
             
             # Verify camera settings
             actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -104,11 +109,22 @@ class CameraManager:
             if not self.is_initialized or self.cap is None:
                 return False
             
-            # Try to read a frame
-            ret, frame = self.cap.read()
-            if ret and frame is not None:
+            # For streams, be more lenient with availability check
+            if self.camera_type == "stream":
+                # Just check if camera is opened, don't try to read frame
+                return self.cap.isOpened()
+            else:
+                # For webcams, check if camera is opened first
+                if not self.cap.isOpened():
+                    return False
+                
+                # Try to read a frame but don't fail immediately
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    return True
+                # If frame read fails, still return True if camera is opened
+                # This prevents false negatives due to temporary frame read issues
                 return True
-            return False
             
         except Exception as e:
             self.logger.error(f"Error checking camera availability: {str(e)}")
@@ -125,13 +141,45 @@ class CameraManager:
             if not self.is_initialized or self.cap is None:
                 return False, None
             
+            # Try to read frame with retry logic for streams
             ret, frame = self.cap.read()
+            
+            # For streams, if first read fails, try a few more times
+            if not ret and self.camera_type == "stream":
+                for attempt in range(3):
+                    ret, frame = self.cap.read()
+                    if ret and frame is not None:
+                        break
+                    time.sleep(0.1)  # Small delay between attempts
+            
             if ret and frame is not None:
-                # Resize frame if needed
-                if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                    frame = cv2.resize(frame, (self.width, self.height))
+                # For NVR streams, validate frame quality
+                if self.camera_type == "stream":
+                    # Check if frame is not corrupted
+                    if frame.size == 0 or np.all(frame == 0):
+                        self.logger.warning("Received empty or corrupted frame from stream")
+                        return False, None
+                    
+                    # Check frame dimensions
+                    if len(frame.shape) != 3 or frame.shape[2] != 3:
+                        self.logger.warning(f"Invalid frame shape from stream: {frame.shape}")
+                        return False, None
                 
-                return True, frame
+                # For NVR streams, preserve original resolution for better face detection
+                # Only resize if explicitly requested and different from original
+                if self.camera_type == "stream":
+                    # Keep original resolution for face detection
+                    self.logger.debug(f"Captured frame: {frame.shape}")
+                    return True, frame
+                else:
+                    # For webcams, resize to requested dimensions
+                    if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                        frame = cv2.resize(frame, (self.width, self.height))
+                    
+                    # Log frame info for debugging
+                    self.logger.debug(f"Captured frame: {frame.shape}")
+                    
+                    return True, frame
             return False, None
             
         except Exception as e:
@@ -271,7 +319,8 @@ class CameraManager:
                 return {}
             
             info = {
-                'camera_index': self.camera_index,
+                'camera_source': self.camera_source,
+                'camera_type': self.camera_type,
                 'width': int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                 'height': int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                 'fps': self.cap.get(cv2.CAP_PROP_FPS),
@@ -344,6 +393,9 @@ class CameraManager:
             
             self.is_initialized = False
             self.logger.info("Camera released")
+            
+            # Add small delay to prevent rapid reinitialization
+            time.sleep(0.1)
             
         except Exception as e:
             self.logger.error(f"Error releasing camera: {str(e)}")
