@@ -1,0 +1,38 @@
+---
+globs: test_*.py
+description: Testing and debugging patterns for the face recognition system
+---
+
+# Testing and Debugging Patterns
+
+## Test File Organization
+- All test files follow `test_*.py` naming convention
+- Test files are located in the root directory for easy access
+- Each test file focuses on a specific component or functionality
+
+## Common Test Categories
+- **Detection Tests**: `test_face_detection.py`, `test_simple_detection.py`
+- **Embedding Tests**: `test_embedder_*.py`, `test_encoding_*.py`
+- **Recognition Tests**: `test_recognition.py`, `test_new_recognition.py`
+- **Attendance Tests**: `test_attendance*.py`
+- **Database Tests**: `test_database_*.py`
+- **System Tests**: `test_system.py`, `test_complete_*.py`
+
+## Testing Guidelines
+- Use descriptive test function names
+- Test both success and failure scenarios
+- Include performance benchmarks for detection operations
+- Test with real images when possible
+- Validate confidence thresholds and matching accuracy
+
+## Debug Utilities
+- Use `debug_*.py` files for troubleshooting specific issues
+- Include logging and visualization in debug scripts
+- Test edge cases and error conditions
+- Compare different embedding models and thresholds
+
+## Performance Testing
+- Test detection speed and accuracy
+- Benchmark different model configurations
+- Test with various image qualities and lighting conditions
+- Validate memory usage and resource consumption

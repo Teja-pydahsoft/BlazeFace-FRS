@@ -1,0 +1,31 @@
+---
+globs: app/core/*.py
+description: Core detection and processing architecture patterns
+---
+
+# Core Architecture Patterns
+
+## Detection Pipeline
+- Use [app/core/dual_pipeline.py](mdc:app/core/dual_pipeline.py) as the main detection orchestrator
+- Implement separate detectors for faces and humans
+- All detectors should inherit from base classes with consistent interfaces
+
+## Face Detection Models
+- [app/core/blazeface_detector.py](mdc:app/core/blazeface_detector.py) - Primary face detection using BlazeFace
+- [app/core/human_detector.py](mdc:app/core/human_detector.py) - Human detection for validation
+
+## Face Embedding Models
+- [app/core/facenet_embedder.py](mdc:app/core/facenet_embedder.py) - FaceNet-based face embeddings
+- [app/core/enhanced_face_embedder.py](mdc:app/core/enhanced_face_embedder.py) - Enhanced embedding with preprocessing
+- [app/core/landmark_face_embedder.py](mdc:app/core/landmark_face_embedder.py) - Landmark-based embeddings
+- [app/core/real_facial_embedder.py](mdc:app/core/real_facial_embedder.py) - Real-world face embeddings
+
+## Database Integration
+- [app/core/database.py](mdc:app/core/database.py) - Centralized database management
+- Always use DatabaseManager for all database operations
+- Handle face encodings as numpy arrays with proper serialization
+
+## Error Handling
+- Implement proper logging using the system logger
+- Handle camera initialization failures gracefully
+- Validate model loading and provide fallback options

@@ -1,0 +1,35 @@
+---
+alwaysApply: true
+description: BlazeFace-FRS project structure and architecture guide
+---
+
+# BlazeFace-FRS Project Structure
+
+This is a dual detection system using BlazeFace and FaceNet for facial recognition and attendance management.
+
+## Main Entry Point
+- [main.py](mdc:main.py) - Main application entry point with dependency checking and initialization
+- [run.bat](mdc:run.bat) - Windows batch file for easy application startup
+
+## Core Application Structure
+- `app/` - Main application package
+  - [app/config.json](mdc:app/config.json) - Configuration settings for the system
+  - [app/constants.py](mdc:app/constants.py) - System constants and enums
+  - `app/core/` - Core detection and processing modules
+  - `app/ui/` - User interface components
+  - `app/utils/` - Utility functions
+
+## Key Directories
+- `database/` - SQLite database files for student and attendance data
+- `face_data/` - Stored face images and encodings
+- `models/` - AI model files (BlazeFace, FaceNet, etc.)
+- `assets/` - Application assets and icons
+- `logs/` - Application log files
+
+## Development Files
+- Test files follow pattern: `test_*.py` - Various testing and debugging scripts
+- [requirements.txt](mdc:requirements.txt) - Python dependencies
+- [setup.py](mdc:setup.py) - Package setup configuration
+
+## Database Schema
+The system uses SQLite with tables: students, attendance, face_encodings, detection_logs

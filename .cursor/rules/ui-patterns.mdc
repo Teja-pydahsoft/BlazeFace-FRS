@@ -1,0 +1,29 @@
+---
+globs: app/ui/*.py
+description: UI development patterns and conventions
+---
+
+# UI Development Patterns
+
+## Main Dashboard
+- [app/ui/main_dashboard.py](mdc:app/ui/main_dashboard.py) - Central UI orchestrator
+- Use Tkinter with ttk widgets for modern appearance
+- Implement proper threading for camera operations to avoid UI freezing
+
+## UI Components
+- [app/ui/student_registration.py](mdc:app/ui/student_registration.py) - Student registration interface
+- [app/ui/student_management.py](mdc:app/ui/student_management.py) - Student data management
+- [app/ui/attendance_marking.py](mdc:app/ui/attendance_marking.py) - Attendance marking interface
+- [app/ui/attendance_history.py](mdc:app/ui/attendance_history.py) - Attendance history viewer
+
+## UI Guidelines
+- Use consistent color scheme: background '#f0f0f0', primary colors from constants
+- Implement proper error handling with user-friendly messageboxes
+- Use threading for all camera and detection operations
+- Follow responsive design principles for different screen sizes
+- Use PIL.ImageTk for efficient image display in Tkinter
+
+## Camera Integration
+- Use [app/utils/camera_utils.py](mdc:app/utils/camera_utils.py) for camera management
+- Implement proper camera initialization and cleanup
+- Handle camera switching and resolution changes gracefully

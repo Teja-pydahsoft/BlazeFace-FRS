@@ -1,0 +1,23 @@
+{
+    "database_path": "database/blazeface_frs.db",
+    "face_data_path": "face_data/",
+    "models_path": "models/",
+    "camera_index": 0,
+    "camera_sources": {
+        "webcam": "0",
+        "nvr_camera": "rtsp://admin:nvr@pydah@192.168.3.235:554/stream1",
+        "ip_camera": "http://192.168.3.235:8080/video",
+        "video_file": "test_video.mp4"
+    },
+    "detection_confidence": 0.3,
+    "recognition_confidence": 0.85,
+    "min_confidence_gap": 0.02,
+    "blazeface_model_path": "models/blazeface_640x640.tflite",
+    "facenet_model_path": "models/facenet_keras.h5",
+    "human_detection_model_path": "models/mobilenet_ssd.tflite",
+    "max_faces": 10,
+    "face_encoding_dimension": 128,
+    "attendance_timeout": 30,
+    "ui_theme": "light",
+    "log_level": "INFO"
+}

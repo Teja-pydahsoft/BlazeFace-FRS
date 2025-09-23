@@ -1,0 +1,37 @@
+---
+alwaysApply: true
+description: Project dependencies and environment setup
+---
+
+# Dependencies and Environment
+
+## Core Dependencies
+From [requirements.txt](mdc:requirements.txt):
+- `opencv-python>=4.8.0` - Computer vision and camera operations
+- `numpy>=1.24.0` - Numerical operations and array handling
+- `tensorflow>=2.13.0` - Machine learning and model inference
+- `mediapipe>=0.10.5` - Face detection and landmark extraction
+- `Pillow>=10.0.0` - Image processing and Tkinter integration
+
+## Development Environment
+- Python 3.8+ required
+- Virtual environment recommended (see `venv/` directory)
+- Windows development environment (PowerShell, batch files)
+
+## Model Files
+Required model files (should be in `models/` directory):
+- `blazeface_640x640.tflite` - BlazeFace face detection model
+- `facenet_keras.h5` - FaceNet embedding model
+- `mobilenet_ssd.tflite` - Human detection model
+
+## Configuration
+- Update [app/config.json](mdc:app/config.json) for model paths and settings
+- Adjust confidence thresholds based on testing results
+- Configure camera settings for your hardware
+
+## Installation
+```bash
+pip install -r requirements.txt
+python main.py
+```
+Or use [run.bat](mdc:run.bat) for Windows quick start.

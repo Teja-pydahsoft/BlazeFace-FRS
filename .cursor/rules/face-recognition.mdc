@@ -1,0 +1,35 @@
+---
+globs: app/core/*embedder*.py,app/core/*detector*.py
+description: Face recognition and detection implementation patterns
+---
+
+# Face Recognition Implementation
+
+## Detection Pipeline
+1. **Human Detection First**: Use [app/core/human_detector.py](mdc:app/core/human_detector.py) to validate human presence
+2. **Face Detection**: Apply [app/core/blazeface_detector.py](mdc:app/core/blazeface_detector.py) for face localization
+3. **Face Embedding**: Extract features using appropriate embedder
+4. **Matching**: Compare against stored encodings in database
+
+## Embedding Models
+Choose embedder based on use case:
+- **FaceNet**: [app/core/facenet_embedder.py](mdc:app/core/facenet_embedder.py) - General purpose, good accuracy
+- **Enhanced**: [app/core/enhanced_face_embedder.py](mdc:app/core/enhanced_face_embedder.py) - Preprocessing + FaceNet
+- **Landmark**: [app/core/landmark_face_embedder.py](mdc:app/core/landmark_face_embedder.py) - Geometric features
+- **Real-world**: [app/core/real_facial_embedder.py](mdc:app/core/real_facial_embedder.py) - Optimized for real conditions
+
+## Confidence Thresholds
+- Detection confidence: 0.7 (configurable in [app/config.json](mdc:app/config.json))
+- Recognition confidence: 0.6 (adjust based on testing)
+- Use test files like `test_*_threshold.py` to validate thresholds
+
+## Face Encoding Storage
+- Store encodings as numpy arrays in SQLite database
+- Use proper serialization/deserialization for numpy data
+- Maintain encoding quality and consistency across registrations
+
+## Performance Optimization
+- Cache loaded models to avoid reloading
+- Use batch processing when possible
+- Implement proper error handling for model failures
+- Monitor memory usage with large datasets
