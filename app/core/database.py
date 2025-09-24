@@ -56,6 +56,7 @@ class DatabaseManager:
                         student_id TEXT NOT NULL,
                         encoding BLOB NOT NULL,
                         encoding_type TEXT DEFAULT 'facenet',
+                        image_path TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         FOREIGN KEY (student_id) REFERENCES students (student_id)
                     )
@@ -74,6 +75,64 @@ class DatabaseManager:
                         notes TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         FOREIGN KEY (student_id) REFERENCES students (student_id)
+                    )
+                """)
+                
+                # Recognition logs table for monitoring and analysis
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS recognition_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        student_id TEXT,
+                        detected_face_id TEXT,
+                        confidence_score REAL NOT NULL,
+                        embedder_type TEXT NOT NULL,
+                        threshold_used REAL NOT NULL,
+                        recognition_result TEXT NOT NULL,
+                        image_path TEXT,
+                        processing_time_ms REAL,
+                        face_bbox_x INTEGER,
+                        face_bbox_y INTEGER,
+                        face_bbox_w INTEGER,
+                        face_bbox_h INTEGER,
+                        session_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (student_id) REFERENCES students (student_id)
+                    )
+                """)
+                
+                # Performance metrics table for threshold tuning
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS performance_metrics (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        embedder_type TEXT NOT NULL,
+                        threshold_value REAL NOT NULL,
+                        true_positives INTEGER DEFAULT 0,
+                        false_positives INTEGER DEFAULT 0,
+                        true_negatives INTEGER DEFAULT 0,
+                        false_negatives INTEGER DEFAULT 0,
+                        accuracy REAL,
+                        precision_score REAL,
+                        recall_score REAL,
+                        f1_score REAL,
+                        test_date DATE NOT NULL,
+                        dataset_size INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Manual overrides table for tracking admin interventions
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS manual_overrides (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        student_id TEXT NOT NULL,
+                        original_result TEXT,
+                        override_action TEXT NOT NULL,
+                        override_reason TEXT,
+                        admin_user TEXT,
+                        attendance_record_id INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (student_id) REFERENCES students (student_id),
+                        FOREIGN KEY (attendance_record_id) REFERENCES attendance (id)
                     )
                 """)
                 
@@ -193,7 +252,7 @@ class DatabaseManager:
             return []
     
     def add_face_encoding(self, student_id: str, encoding: np.ndarray, 
-                         encoding_type: str = 'facenet') -> bool:
+                         encoding_type: str = 'facenet', image_path: str = None) -> bool:
         """
         Add face encoding for a student
         
@@ -213,9 +272,9 @@ class DatabaseManager:
                 encoding_bytes = encoding.tobytes()
                 
                 cursor.execute("""
-                    INSERT INTO face_encodings (student_id, encoding, encoding_type)
-                    VALUES (?, ?, ?)
-                """, (student_id, encoding_bytes, encoding_type))
+                    INSERT INTO face_encodings (student_id, encoding, encoding_type, image_path)
+                    VALUES (?, ?, ?, ?)
+                """, (student_id, encoding_bytes, encoding_type, image_path))
                 
                 conn.commit()
                 self.logger.info(f"Face encoding added for student: {student_id}")
@@ -225,7 +284,7 @@ class DatabaseManager:
             self.logger.error(f"Error adding face encoding: {str(e)}")
             return False
     
-    def get_face_encodings(self, student_id: str = None) -> List[Tuple[str, np.ndarray, str]]:
+    def get_face_encodings(self, student_id: str = None) -> List[Tuple[str, np.ndarray, str, str]]:
         """
         Get face encodings from the database
         
@@ -233,7 +292,7 @@ class DatabaseManager:
             student_id: Specific student ID (optional)
             
         Returns:
-            List of tuples (student_id, encoding, encoding_type)
+            List of tuples (student_id, encoding, encoding_type, image_path)
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -241,12 +300,12 @@ class DatabaseManager:
                 
                 if student_id:
                     cursor.execute("""
-                        SELECT student_id, encoding, encoding_type 
+                        SELECT student_id, encoding, encoding_type, image_path 
                         FROM face_encodings WHERE student_id = ?
                     """, (student_id,))
                 else:
                     cursor.execute("""
-                        SELECT student_id, encoding, encoding_type 
+                        SELECT student_id, encoding, encoding_type, image_path 
                         FROM face_encodings
                     """)
                 
@@ -254,9 +313,9 @@ class DatabaseManager:
                 encodings = []
                 
                 for row in rows:
-                    student_id, encoding_bytes, encoding_type = row
+                    student_id, encoding_bytes, encoding_type, image_path = row
                     encoding = np.frombuffer(encoding_bytes, dtype=np.float32)
-                    encodings.append((student_id, encoding, encoding_type))
+                    encodings.append((student_id, encoding, encoding_type, image_path))
                 
                 return encodings
                 
@@ -577,6 +636,198 @@ class DatabaseManager:
             self.logger.error(f"Error deleting attendance records: {str(e)}")
             return False
     
+    def log_recognition_result(self, student_id: str, detected_face_id: str, 
+                             confidence_score: float, embedder_type: str, 
+                             threshold_used: float, recognition_result: str,
+                             image_path: str = None, processing_time_ms: float = None,
+                             face_bbox: tuple = None, session_id: str = None) -> bool:
+        """
+        Log recognition result for monitoring and analysis
+        
+        Args:
+            student_id: Student ID (None if unknown)
+            detected_face_id: Unique identifier for detected face
+            confidence_score: Recognition confidence score
+            embedder_type: Type of embedder used
+            threshold_used: Threshold value used for recognition
+            recognition_result: Result ('matched', 'no_match', 'unknown')
+            image_path: Path to face image (optional)
+            processing_time_ms: Processing time in milliseconds (optional)
+            face_bbox: Face bounding box (x, y, w, h) (optional)
+            session_id: Session identifier (optional)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Extract bounding box coordinates
+                bbox_x = bbox_y = bbox_w = bbox_h = None
+                if face_bbox and len(face_bbox) >= 4:
+                    bbox_x, bbox_y, bbox_w, bbox_h = face_bbox[:4]
+                
+                cursor.execute("""
+                    INSERT INTO recognition_logs (
+                        student_id, detected_face_id, confidence_score, embedder_type,
+                        threshold_used, recognition_result, image_path, processing_time_ms,
+                        face_bbox_x, face_bbox_y, face_bbox_w, face_bbox_h, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (student_id, detected_face_id, confidence_score, embedder_type,
+                      threshold_used, recognition_result, image_path, processing_time_ms,
+                      bbox_x, bbox_y, bbox_w, bbox_h, session_id))
+                
+                conn.commit()
+                self.logger.debug(f"Recognition result logged for {student_id or 'unknown'}")
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"Error logging recognition result: {str(e)}")
+            return False
+    
+    def log_manual_override(self, student_id: str, original_result: str,
+                           override_action: str, override_reason: str = None,
+                           admin_user: str = None, attendance_record_id: int = None) -> bool:
+        """
+        Log manual override actions for tracking admin interventions
+        
+        Args:
+            student_id: Student ID
+            original_result: Original recognition result
+            override_action: Action taken (e.g., 'mark_present', 'mark_absent')
+            override_reason: Reason for override (optional)
+            admin_user: Admin user who made the override (optional)
+            attendance_record_id: Related attendance record ID (optional)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    INSERT INTO manual_overrides (
+                        student_id, original_result, override_action, override_reason,
+                        admin_user, attendance_record_id
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                """, (student_id, original_result, override_action, override_reason,
+                      admin_user, attendance_record_id))
+                
+                conn.commit()
+                self.logger.info(f"Manual override logged for student {student_id}")
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"Error logging manual override: {str(e)}")
+            return False
+
+    def get_recognition_logs(self, student_id: str = None, embedder_type: str = None,
+                           date_from: str = None, date_to: str = None, 
+                           limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get recognition logs for analysis
+        
+        Args:
+            student_id: Filter by student ID (optional)
+            embedder_type: Filter by embedder type (optional)
+            date_from: Start date (YYYY-MM-DD format)
+            date_to: End date (YYYY-MM-DD format)
+            limit: Maximum number of records to return
+            
+        Returns:
+            List of recognition log dictionaries
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                query = """
+                    SELECT * FROM recognition_logs WHERE 1=1
+                """
+                params = []
+                
+                if student_id:
+                    query += " AND student_id = ?"
+                    params.append(student_id)
+                
+                if embedder_type:
+                    query += " AND embedder_type = ?"
+                    params.append(embedder_type)
+                
+                if date_from:
+                    query += " AND DATE(created_at) >= ?"
+                    params.append(date_from)
+                
+                if date_to:
+                    query += " AND DATE(created_at) <= ?"
+                    params.append(date_to)
+                
+                query += " ORDER BY created_at DESC LIMIT ?"
+                params.append(limit)
+                
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                
+                logs = []
+                columns = [description[0] for description in cursor.description]
+                
+                for row in rows:
+                    log_dict = dict(zip(columns, row))
+                    logs.append(log_dict)
+                
+                return logs
+                
+        except Exception as e:
+            self.logger.error(f"Error getting recognition logs: {str(e)}")
+            return []
+    
+    def get_performance_metrics(self, embedder_type: str = None, 
+                              date_from: str = None) -> List[Dict[str, Any]]:
+        """
+        Get performance metrics for threshold tuning
+        
+        Args:
+            embedder_type: Filter by embedder type (optional)
+            date_from: Start date for metrics (optional)
+            
+        Returns:
+            List of performance metric dictionaries
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                query = "SELECT * FROM performance_metrics WHERE 1=1"
+                params = []
+                
+                if embedder_type:
+                    query += " AND embedder_type = ?"
+                    params.append(embedder_type)
+                
+                if date_from:
+                    query += " AND test_date >= ?"
+                    params.append(date_from)
+                
+                query += " ORDER BY test_date DESC, threshold_value ASC"
+                
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                
+                metrics = []
+                columns = [description[0] for description in cursor.description]
+                
+                for row in rows:
+                    metric_dict = dict(zip(columns, row))
+                    metrics.append(metric_dict)
+                
+                return metrics
+                
+        except Exception as e:
+            self.logger.error(f"Error getting performance metrics: {str(e)}")
+            return []
+
     def close(self):
         """Close database connection"""
         # SQLite connections are automatically closed when the context manager exits

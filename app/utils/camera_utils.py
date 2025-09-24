@@ -57,6 +57,9 @@ class CameraManager:
     def _init_camera(self):
         """Initialize camera"""
         try:
+            # Add small delay to prevent camera conflicts
+            time.sleep(0.1)
+            
             # Handle different camera types
             if self.camera_type == "webcam":
                 camera_index = int(self.camera_source) if isinstance(self.camera_source, str) else self.camera_source
@@ -129,6 +132,10 @@ class CameraManager:
         except Exception as e:
             self.logger.error(f"Error checking camera availability: {str(e)}")
             return False
+    
+    def is_camera_in_use(self) -> bool:
+        """Check if camera is currently being used by this manager"""
+        return self.is_capturing
     
     def get_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
         """

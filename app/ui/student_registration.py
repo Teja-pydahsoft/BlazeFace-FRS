@@ -14,13 +14,15 @@ from typing import Optional, Dict, Any
 import threading
 import time
 
-from ..core.simple_face_embedder import SimpleFaceEmbedder
+from ..core.standard_face_embedder import StandardFaceEmbedder
 from ..core.blazeface_detector import BlazeFaceDetector
 from ..core.database import DatabaseManager
 from ..utils.camera_utils import CameraManager
+from ..utils.encoding_quality_checker import EncodingQualityChecker
 
 class StudentRegistrationDialog:
-    def __init__(self, parent, database_manager: DatabaseManager, config: Dict[str, Any]):
+    def __init__(self, parent, database_manager: DatabaseManager, config: Dict[str, Any], 
+                 existing_camera_manager: CameraManager = None):
         """
         Initialize student registration dialog
         
@@ -28,6 +30,7 @@ class StudentRegistrationDialog:
             parent: Parent window
             database_manager: Database manager instance
             config: Application configuration
+            existing_camera_manager: Existing camera manager to reuse (optional)
         """
         self.parent = parent
         self.database_manager = database_manager
@@ -37,8 +40,22 @@ class StudentRegistrationDialog:
         self.face_detector = BlazeFaceDetector(
             min_detection_confidence=config.get('detection_confidence', 0.7)
         )
-        self.face_embedder = SimpleFaceEmbedder()
-        self.camera_manager = CameraManager(config.get('camera_index', 0))
+        self.face_embedder = StandardFaceEmbedder(model='large')
+        
+        # Use existing camera manager or create new one
+        if existing_camera_manager and existing_camera_manager.is_camera_available():
+            self.camera_manager = existing_camera_manager
+            self.using_shared_camera = True
+            print("Using shared camera manager")
+        else:
+            self.camera_manager = CameraManager(config.get('camera_index', 0))
+            self.using_shared_camera = False
+            print("Created new camera manager for registration")
+            
+        # Store reference for potential fallback
+        self.fallback_camera_manager = None
+            
+        self.quality_checker = EncodingQualityChecker()
         
         # UI state
         self.is_capturing = False
@@ -57,6 +74,12 @@ class StudentRegistrationDialog:
         
         # Setup UI
         self._setup_ui()
+        
+        # Handle dialog close event
+        self.dialog.protocol("WM_DELETE_WINDOW", self._cancel)
+        
+        # Ensure dialog is fully initialized before starting camera
+        self.dialog.update_idletasks()
         
         # Start camera preview
         self._start_camera_preview()
@@ -134,10 +157,18 @@ class StudentRegistrationDialog:
         camera_frame = ttk.LabelFrame(parent, text="Face Capture", padding="10")
         camera_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Camera display
-        self.camera_label = ttk.Label(camera_frame, text="Initializing camera...", 
-                                     anchor=tk.CENTER, background='black', foreground='white')
-        self.camera_label.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+        # Camera display - Use a Canvas for better image display
+        self.camera_canvas = tk.Canvas(camera_frame, width=400, height=300, 
+                                       background='black', highlightthickness=1,
+                                       relief='sunken', bd=2)
+        self.camera_canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+        
+        # Add initial text overlay for status
+        self.camera_canvas.create_text(200, 150, text="Initializing camera...", 
+                                       fill='white', font=('Arial', 12), tags='status_text')
+        
+        # Force canvas to update and be visible
+        self.camera_canvas.update_idletasks()
         
         # Status label
         self.status_label = ttk.Label(camera_frame, text="Status: Initializing...", 
@@ -199,18 +230,77 @@ class StudentRegistrationDialog:
     def _start_camera_preview(self):
         """Start camera preview"""
         try:
+            print(f"Starting camera preview - Using shared camera: {self.using_shared_camera}")
+            print(f"Camera manager available: {self.camera_manager.is_camera_available()}")
+            
             if self.camera_manager.is_camera_available():
                 self.capture_btn.config(state=tk.NORMAL)
-                self.camera_label.config(text="Initializing camera...")
+                self.camera_canvas.delete('all')
+                self.camera_canvas.create_text(200, 150, text="Initializing camera...", 
+                                              fill='white', font=('Arial', 12), tags='status_text')
                 self.status_label.config(text="Status: Initializing camera...", foreground='blue')
-                self._update_camera_preview()
+                
+                # Ensure canvas is properly sized and visible
+                self._ensure_canvas_visible()
+                
+                # Add small delay to ensure camera is ready
+                self.dialog.after(500, self._update_camera_preview)
             else:
-                self.camera_label.config(text="Camera not available")
+                # Try fallback camera if shared camera doesn't work
+                if self.using_shared_camera and not self.fallback_camera_manager:
+                    print("Shared camera not available, trying fallback...")
+                    self.fallback_camera_manager = CameraManager(self.config.get('camera_index', 0))
+                    if self.fallback_camera_manager.is_camera_available():
+                        self.camera_manager = self.fallback_camera_manager
+                        self.using_shared_camera = False
+                        print("Fallback camera initialized successfully")
+                        self.capture_btn.config(state=tk.NORMAL)
+                        self.camera_canvas.delete('all')
+                        self.camera_canvas.create_text(200, 150, text="Initializing fallback camera...", 
+                                                      fill='orange', font=('Arial', 12), tags='status_text')
+                        self.status_label.config(text="Status: Using fallback camera...", foreground='orange')
+                        self.dialog.after(500, self._update_camera_preview)
+                        return
+                
+                self.camera_canvas.delete('all')
+                self.camera_canvas.create_text(200, 150, text="Camera not available", 
+                                              fill='red', font=('Arial', 12), tags='status_text')
                 self.status_label.config(text="Status: Camera not available", foreground='red')
+                print("Camera not available in student registration")
         except Exception as e:
             print(f"Error starting camera preview: {e}")
-            self.camera_label.config(text=f"Camera error: {str(e)}")
+            self.camera_canvas.delete('all')
+            self.camera_canvas.create_text(200, 150, text=f"Camera error: {str(e)}", 
+                                          fill='red', font=('Arial', 12), tags='status_text')
             self.status_label.config(text=f"Status: Error - {str(e)}", foreground='red')
+    
+    def _ensure_canvas_visible(self):
+        """Ensure canvas is properly sized and visible"""
+        try:
+            # Force canvas to be visible and properly sized
+            self.camera_canvas.update_idletasks()
+            
+            # Get actual canvas dimensions
+            canvas_width = self.camera_canvas.winfo_width()
+            canvas_height = self.camera_canvas.winfo_height()
+            
+            # If canvas is too small, resize it
+            if canvas_width < 100 or canvas_height < 100:
+                self.camera_canvas.config(width=400, height=300)
+                self.camera_canvas.update_idletasks()
+                # Canvas resized - removed verbose logging
+            
+            # Create a test rectangle to verify canvas is working
+            self.camera_canvas.delete('all')
+            self.camera_canvas.create_rectangle(10, 10, canvas_width-10, canvas_height-10, 
+                                              outline='white', width=2, fill='black')
+            self.camera_canvas.create_text(canvas_width//2, canvas_height//2, 
+                                          text="Camera Initializing...", 
+                                          fill='white', font=('Arial', 12))
+            self.camera_canvas.update_idletasks()
+            
+        except Exception as e:
+            print(f"Error ensuring canvas visibility: {e}")
     
     def _update_camera_preview(self):
         """Update camera preview"""
@@ -218,6 +308,8 @@ class StudentRegistrationDialog:
             if self.camera_manager.is_camera_available():
                 ret, frame = self.camera_manager.get_frame()
                 if ret and frame is not None:
+                    # Camera frame received - removed verbose logging
+                    
                     # Detect faces in frame
                     faces = self.face_detector.detect_faces(frame)
                     
@@ -228,14 +320,29 @@ class StudentRegistrationDialog:
                     # Resize frame to fit display
                     display_frame = cv2.resize(frame, (400, 300))
                     
-                    # Convert frame for display
-                    frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    frame_pil = Image.fromarray(frame_rgb)
-                    frame_tk = ImageTk.PhotoImage(frame_pil)
-                    
-                    # Update display
-                    self.camera_label.config(image=frame_tk, text="")
-                    self.camera_label.image = frame_tk
+                    # Convert frame for display using Canvas
+                    try:
+                        frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                        frame_pil = Image.fromarray(frame_rgb)
+                        frame_tk = ImageTk.PhotoImage(frame_pil)
+                        
+                        # Clear canvas and display image
+                        self.camera_canvas.delete('all')
+                        self.camera_canvas.create_image(200, 150, image=frame_tk, anchor=tk.CENTER)
+                        self.camera_canvas.image = frame_tk  # Keep reference to prevent garbage collection
+                        
+                        # Force canvas update and ensure visibility
+                        self.camera_canvas.update_idletasks()
+                        
+                        # Canvas image updated successfully - removed verbose logging
+                        
+                    except Exception as img_error:
+                        print(f"Error converting/displaying image: {img_error}")
+                        # Fallback: show text on canvas
+                        self.camera_canvas.delete('all')
+                        self.camera_canvas.create_text(200, 150, text=f"Camera Active\nFrame: {frame.shape}", 
+                                                      fill='green', font=('Arial', 12), tags='status_text')
+                        self.camera_canvas.update_idletasks()
                     
                     # Update status
                     face_count = len(faces)
@@ -245,15 +352,26 @@ class StudentRegistrationDialog:
                     # Store original frame for face capture
                     self.current_frame = frame
                 else:
-                    self.camera_label.config(text="No camera feed - Click 'Capture Face' to retry")
+                    print("No camera frame received")
+                    self.camera_canvas.delete('all')
+                    self.camera_canvas.create_text(200, 150, text="No camera feed\nClick 'Capture Face' to retry", 
+                                                  fill='red', font=('Arial', 12), tags='status_text')
                     self.status_label.config(text="Status: No camera feed", foreground='red')
+            else:
+                print("Camera not available during update")
+                self.camera_canvas.delete('all')
+                self.camera_canvas.create_text(200, 150, text="Camera not available", 
+                                              fill='red', font=('Arial', 12), tags='status_text')
+                self.status_label.config(text="Status: Camera not available", foreground='red')
             
             # Schedule next update
             self.dialog.after(50, self._update_camera_preview)
             
         except Exception as e:
             print(f"Error updating camera preview: {e}")
-            self.camera_label.config(text=f"Camera error: {str(e)}")
+            self.camera_canvas.delete('all')
+            self.camera_canvas.create_text(200, 150, text=f"Camera error: {str(e)}", 
+                                          fill='red', font=('Arial', 12), tags='status_text')
             self.status_label.config(text=f"Status: Error - {str(e)}", foreground='red')
             self.dialog.after(1000, self._update_camera_preview)
     
@@ -288,19 +406,56 @@ class StudentRegistrationDialog:
                 embedding = self.face_embedder.get_embedding(face_region)
                 
                 if embedding is not None:
-                    # Store captured face
+                    # Check encoding quality before storing
+                    student_id = self.student_id_var.get().strip()
+                    
+                    # Get existing encodings for this student
+                    existing_encodings = []
+                    if student_id:
+                        existing_encs = self.database_manager.get_face_encodings(student_id)
+                        existing_encodings = [enc for _, enc, _ in existing_encs]
+                    
+                    # Get encodings for other students
+                    other_encodings = []
+                    all_encs = self.database_manager.get_face_encodings()
+                    for sid, enc, _ in all_encs:
+                        if sid != student_id:
+                            other_encodings.append(enc)
+                    
+                    # Check quality
+                    is_acceptable, reason, quality_metrics = self.quality_checker.check_new_encoding_quality(
+                        embedding, existing_encodings, other_encodings, student_id
+                    )
+                    
+                    if not is_acceptable:
+                        messagebox.showwarning("Quality Check Failed", 
+                            f"Face encoding quality check failed:\n\n{reason}\n\n"
+                            f"Please try again with:\n"
+                            f"- Better lighting\n"
+                            f"- Clearer face positioning\n"
+                            f"- Different angle")
+                        return
+                    
+                    # Store captured face (image will be saved during registration)
                     face_data = {
                         'image': face_region,
                         'embedding': embedding,
                         'confidence': confidence,
-                        'timestamp': time.time()
+                        'timestamp': time.time(),
+                        'quality_metrics': quality_metrics,
+                        'image_path': None  # Will be set during registration
                     }
                     self.captured_faces.append(face_data)
                     
                     # Update display
                     self._update_captured_faces_display()
                     
-                    messagebox.showinfo("Success", f"Face captured successfully!\nConfidence: {confidence:.2f}\n\nYou can capture multiple angles for better recognition.")
+                    quality_score = quality_metrics.get('quality_score', 0.0)
+                    messagebox.showinfo("Success", 
+                        f"Face captured successfully!\n"
+                        f"Confidence: {confidence:.2f}\n"
+                        f"Quality Score: {quality_score:.2f}\n\n"
+                        f"You can capture multiple angles for better recognition.")
                 else:
                     messagebox.showerror("Error", "Failed to generate face embedding. Please try again.")
             else:
@@ -374,12 +529,30 @@ class StudentRegistrationDialog:
                 debug_text += f"Frame Shape: {self.current_frame.shape}\n"
             debug_text += f"Camera Info: {info}\n"
             
+            # Canvas debug info
+            debug_text += f"\nCanvas Debug:\n"
+            debug_text += f"Canvas Size: {self.camera_canvas.winfo_width()}x{self.camera_canvas.winfo_height()}\n"
+            debug_text += f"Canvas Visible: {self.camera_canvas.winfo_viewable()}\n"
+            debug_text += f"Canvas Items: {len(self.camera_canvas.find_all())}\n"
+            
             # Test face detection
             if self.current_frame is not None:
                 faces = self.face_detector.detect_faces(self.current_frame)
                 debug_text += f"Faces Detected: {len(faces)}\n"
                 if faces:
                     debug_text += f"First Face: {faces[0]}\n"
+            
+            # Test canvas image display
+            debug_text += f"\nTesting Canvas Display...\n"
+            try:
+                # Create a test rectangle to verify canvas is working
+                self.camera_canvas.delete('all')
+                self.camera_canvas.create_rectangle(50, 50, 350, 250, fill='red', outline='white', width=2)
+                self.camera_canvas.create_text(200, 150, text="Canvas Test", fill='white', font=('Arial', 16))
+                self.camera_canvas.update_idletasks()
+                debug_text += "Canvas test rectangle created successfully\n"
+            except Exception as e:
+                debug_text += f"Canvas test failed: {str(e)}\n"
             
             messagebox.showinfo("Camera Debug", debug_text)
             
@@ -431,15 +604,91 @@ class StudentRegistrationDialog:
                     messagebox.showerror("Error", "Failed to add student record")
                     return
             
-            # Add face encodings
+            # Save face images and add face encodings with multi-image processing
             success_count = 0
-            for face_data in self.captured_faces:
-                success = self.database_manager.add_face_encoding(
-                    student_data['student_id'],
-                    face_data['embedding']
-                )
-                if success:
-                    success_count += 1
+            face_data_dir = self.config.get('face_data_path', 'face_data')
+            os.makedirs(face_data_dir, exist_ok=True)
+            
+            # Determine embedder type for encoding storage
+            embedder_type = 'standard_face'  # Default to new embedder
+            if hasattr(self.face_embedder, '__class__'):
+                if 'InsightFace' in self.face_embedder.__class__.__name__:
+                    embedder_type = 'insightface'
+                elif 'Standard' in self.face_embedder.__class__.__name__:
+                    embedder_type = 'standard_face'
+                elif 'FaceNet' in self.face_embedder.__class__.__name__:
+                    embedder_type = 'facenet'
+                elif 'Simple' in self.face_embedder.__class__.__name__:
+                    embedder_type = 'simple'
+            
+            # Process multiple face captures with quality assessment
+            processed_embeddings = []
+            valid_images = []
+            
+            for i, face_data in enumerate(self.captured_faces):
+                # Generate unique filename for this face
+                timestamp = int(time.time() * 1000) + i  # milliseconds + index for uniqueness
+                face_filename = f"{student_data['student_id']}_{timestamp}.jpg"
+                face_filepath = os.path.join(face_data_dir, face_filename)
+                
+                # Save face image
+                cv2.imwrite(face_filepath, face_data['image'])
+                
+                # Validate embedding quality
+                embedding = face_data['embedding']
+                if embedding is not None and len(embedding) > 0:
+                    # Check embedding quality (not all zeros, reasonable norm)
+                    embedding_norm = np.linalg.norm(embedding)
+                    if embedding_norm > 0.1:  # Reasonable threshold for valid embedding
+                        processed_embeddings.append(embedding)
+                        valid_images.append(face_filepath)
+                        
+                        # Add individual face encoding with image path
+                        success = self.database_manager.add_face_encoding(
+                            student_data['student_id'],
+                            embedding,
+                            embedder_type,
+                            face_filepath
+                        )
+                        if success:
+                            success_count += 1
+                    else:
+                        print(f"Warning: Low quality embedding for face {i}, skipping")
+                else:
+                    print(f"Warning: Invalid embedding for face {i}, skipping")
+            
+            # Create averaged embedding for better recognition (if multiple valid embeddings)
+            if len(processed_embeddings) > 1:
+                try:
+                    # Average the embeddings for better recognition
+                    avg_embedding = np.mean(processed_embeddings, axis=0)
+                    avg_filename = f"{student_data['student_id']}_averaged.jpg"
+                    avg_filepath = os.path.join(face_data_dir, avg_filename)
+                    
+                    # Save a representative image (first valid image)
+                    if valid_images:
+                        cv2.imwrite(avg_filepath, cv2.imread(valid_images[0]))
+                    
+                    # Store averaged embedding
+                    success = self.database_manager.add_face_encoding(
+                        student_data['student_id'],
+                        avg_embedding,
+                        f"{embedder_type}_averaged",
+                        avg_filepath
+                    )
+                    if success:
+                        success_count += 1
+                        print(f"Added averaged embedding from {len(processed_embeddings)} captures")
+                        
+                except Exception as e:
+                    print(f"Error creating averaged embedding: {e}")
+            
+            # Log registration statistics
+            print(f"Registration Summary:")
+            print(f"  Total captures: {len(self.captured_faces)}")
+            print(f"  Valid embeddings: {len(processed_embeddings)}")
+            print(f"  Stored encodings: {success_count}")
+            print(f"  Embedder type: {embedder_type}")
             
             if success_count > 0:
                 messagebox.showinfo("Success", 
@@ -455,7 +704,17 @@ class StudentRegistrationDialog:
     def _cancel(self):
         """Cancel registration and close dialog"""
         try:
-            self.camera_manager.release()
+            # Release fallback camera if we created it
+            if self.fallback_camera_manager:
+                self.fallback_camera_manager.release()
+                print("Released fallback camera manager")
+            
+            # Only release main camera if we created our own (not shared)
+            if not self.using_shared_camera and not self.fallback_camera_manager:
+                self.camera_manager.release()
+                print("Released camera manager for registration")
+            else:
+                print("Keeping shared camera manager active")
             self.dialog.destroy()
         except Exception as e:
             print(f"Error closing dialog: {e}")

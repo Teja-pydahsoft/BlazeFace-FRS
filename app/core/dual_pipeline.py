@@ -13,14 +13,14 @@ import logging
 
 from .blazeface_detector import BlazeFaceDetector
 from .human_detector import HumanDetector
-from .simple_face_embedder import SimpleFaceEmbedder
+from .standard_face_embedder import StandardFaceEmbedder
 
 class DualPipeline:
     def __init__(self, 
                  config: Dict[str, Any],
                  face_detector: BlazeFaceDetector = None,
                  human_detector: HumanDetector = None,
-                 face_embedder: SimpleFaceEmbedder = None):
+                 face_embedder: StandardFaceEmbedder = None):
         """
         Initialize dual pipeline system
         
@@ -42,7 +42,7 @@ class DualPipeline:
         self.human_detector = human_detector or HumanDetector(
             confidence_threshold=config.get('detection_confidence', 0.7)
         )
-        self.face_embedder = face_embedder or SimpleFaceEmbedder()
+        self.face_embedder = face_embedder or StandardFaceEmbedder(model='large')
         
         # Pipeline state
         self.is_running = False

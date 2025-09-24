@@ -16,6 +16,7 @@ import logging
 from ..core.dual_pipeline import DualPipeline
 from ..core.database import DatabaseManager
 from ..core.blazeface_detector import BlazeFaceDetector
+from ..core.threshold_tuner import ThresholdTuner
 from ..utils.camera_utils import CameraManager
 
 class AttendanceMarkingDialog:
@@ -38,6 +39,9 @@ class AttendanceMarkingDialog:
         self.face_detector = BlazeFaceDetector(min_detection_confidence=0.3)  # Lower threshold for better detection
         self.pipeline = None
         self.face_embedder = None
+        
+        # Initialize threshold tuner
+        self.threshold_tuner = ThresholdTuner(config, database_manager)
         
         # Detect camera type for pipeline optimization
         self.camera_type = self._detect_camera_type(camera_source)
@@ -202,10 +206,21 @@ class AttendanceMarkingDialog:
         camera_frame = ttk.LabelFrame(parent, text="Live Recognition", padding="10")
         camera_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Camera display
-        self.camera_label = ttk.Label(camera_frame, text="Initializing camera...", 
-                                     anchor=tk.CENTER, background='black', foreground='white')
-        self.camera_label.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        # Camera display - Use Canvas for better image display
+        self.camera_canvas = tk.Canvas(camera_frame, width=400, height=300, 
+                                       background='black', highlightthickness=1,
+                                       relief='sunken', bd=2)
+        self.camera_canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # Add initial text overlay for status
+        self.camera_canvas.create_text(200, 150, text="Initializing camera...", 
+                                       fill='white', font=('Arial', 12), tags='status_text')
+        
+        # Force canvas to update and be visible
+        self.camera_canvas.update_idletasks()
+        
+        # Ensure canvas is properly sized
+        self._ensure_canvas_visible()
         
         # Recognition info
         self.recognition_info = tk.Text(camera_frame, height=8, width=50, wrap=tk.WORD)
@@ -242,27 +257,34 @@ class AttendanceMarkingDialog:
         self._load_todays_attendance()
     
     def _initialize_face_embedder(self):
-        """Initialize face embedder with best available option"""
+        """Initialize face embedder with best available option - InsightFace primary, dlib fallback"""
         try:
-            # Try FaceNet first (most accurate)
+            # Try InsightFaceEmbedder first (ArcFace - highest accuracy)
             try:
-                from ..core.facenet_embedder import FaceNetEmbedder
-                facenet_model_path = self.config.get('facenet_model_path', 'models/facenet_keras.h5')
-                self.face_embedder = FaceNetEmbedder(model_path=facenet_model_path)
-                print("FaceNet embedder initialized successfully")
+                from ..core.insightface_embedder import InsightFaceEmbedder
+                self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')
+                print("InsightFaceEmbedder (ArcFace) initialized successfully as PRIMARY")
             except Exception as e:
-                print(f"FaceNet embedder failed, trying Enhanced embedder: {e}")
-                # Fallback to Enhanced embedder
+                print(f"InsightFaceEmbedder failed, trying StandardFaceEmbedder: {e}")
+                # Fallback to StandardFaceEmbedder (dlib)
                 try:
-                    from ..core.enhanced_face_embedder import EnhancedFaceEmbedder
-                    self.face_embedder = EnhancedFaceEmbedder()
-                    print("Enhanced face embedder initialized successfully")
+                    from ..core.standard_face_embedder import StandardFaceEmbedder
+                    self.face_embedder = StandardFaceEmbedder(model='large')
+                    print("StandardFaceEmbedder (face_recognition/dlib) initialized successfully as FALLBACK")
                 except Exception as e2:
-                    print(f"Enhanced embedder failed, using Simple embedder: {e2}")
-                    # Final fallback to Simple embedder
-                    from ..core.simple_face_embedder import SimpleFaceEmbedder
-                    self.face_embedder = SimpleFaceEmbedder()
-                    print("Simple face embedder initialized successfully")
+                    print(f"StandardFaceEmbedder failed, trying FaceNet: {e2}")
+                    # Fallback to FaceNet
+                    try:
+                        from ..core.facenet_embedder import FaceNetEmbedder
+                        facenet_model_path = self.config.get('facenet_model_path', 'models/facenet_keras.h5')
+                        self.face_embedder = FaceNetEmbedder(model_path=facenet_model_path)
+                        print("FaceNet embedder initialized successfully as FALLBACK")
+                    except Exception as e3:
+                        print(f"FaceNet embedder failed, using Simple embedder: {e3}")
+                        # Final fallback to Simple embedder
+                        from ..core.simple_face_embedder import SimpleFaceEmbedder
+                        self.face_embedder = SimpleFaceEmbedder()
+                        print("Simple face embedder initialized successfully as FINAL FALLBACK")
         except Exception as e:
             print(f"Error initializing face embedder: {e}")
             self.face_embedder = None
@@ -274,7 +296,7 @@ class AttendanceMarkingDialog:
             self.student_encodings = {}  # student_id -> list of encodings
             self.student_names = {}  # student_id -> name
             
-            for student_id, encoding, encoding_type in self.face_encodings:
+            for student_id, encoding, encoding_type, image_path in self.face_encodings:
                 if student_id not in self.student_encodings:
                     self.student_encodings[student_id] = []
                     # Get student name and cache it
@@ -363,12 +385,44 @@ class AttendanceMarkingDialog:
             if self.camera_manager.is_camera_available():
                 self._update_camera_preview()
             else:
-                self.camera_label.config(text="Camera not available")
+                self.camera_canvas.delete('all')
+                self.camera_canvas.create_text(250, 200, text="Camera not available", 
+                                              fill='red', font=('Arial', 12), tags='status_text')
                 self.status_label.config(text="Status: Camera not available", foreground='red')
         except Exception as e:
             print(f"Error starting camera preview: {e}")
-            self.camera_label.config(text=f"Camera error: {str(e)}")
+            self.camera_canvas.delete('all')
+            self.camera_canvas.create_text(250, 200, text=f"Camera error: {str(e)}", 
+                                          fill='red', font=('Arial', 12), tags='status_text')
             self.status_label.config(text=f"Status: Error - {str(e)}", foreground='red')
+    
+    def _ensure_canvas_visible(self):
+        """Ensure canvas is properly sized and visible"""
+        try:
+            # Force canvas to be visible and properly sized
+            self.camera_canvas.update_idletasks()
+            
+            # Get actual canvas dimensions
+            canvas_width = self.camera_canvas.winfo_width()
+            canvas_height = self.camera_canvas.winfo_height()
+            
+            # If canvas is too small, resize it
+            if canvas_width < 100 or canvas_height < 100:
+                self.camera_canvas.config(width=500, height=400)
+                self.camera_canvas.update_idletasks()
+                # Canvas resized for attendance marking
+            
+            # Create a test rectangle to verify canvas is working
+            self.camera_canvas.delete('all')
+            self.camera_canvas.create_rectangle(10, 10, canvas_width-10, canvas_height-10, 
+                                              outline='white', width=2, fill='black')
+            self.camera_canvas.create_text(canvas_width//2, canvas_height//2, 
+                                          text="Camera Initializing...", 
+                                          fill='white', font=('Arial', 12))
+            self.camera_canvas.update_idletasks()
+            
+        except Exception as e:
+            print(f"Error ensuring canvas visibility: {e}")
     
     def _update_camera_preview(self):
         """Update camera preview with performance optimizations"""
@@ -387,6 +441,9 @@ class AttendanceMarkingDialog:
                     
                     # Process frame through pipeline if running
                     if self.is_running and self.pipeline:
+                        # Initialize results with empty data
+                        results = {'faces': [], 'embeddings': []}
+                        
                         # Only process every few frames for better performance
                         if self._frame_skip_counter % 3 == 0:  # Process every 3rd frame
                             results = self.pipeline.process_frame(frame)
@@ -399,7 +456,8 @@ class AttendanceMarkingDialog:
                                     x, y, w, h, conf = face
                                     print(f"  Face {i}: bbox=({x},{y},{w},{h}), confidence={conf:.3f}")
                             else:
-                                print("No faces detected in current frame")
+                                # No faces detected - removed verbose logging
+                                pass
                             
                             frame = self._draw_enhanced_detections(frame, results)
                         
@@ -409,13 +467,14 @@ class AttendanceMarkingDialog:
                             self._last_recognition_time = current_time
                         else:
                             # Just draw existing detections without processing
-                            frame = self._draw_enhanced_detections(frame, {'faces': [], 'embeddings': []})
+                            frame = self._draw_enhanced_detections(frame, results)
                     elif self.is_running and self.camera_type == 'stream':
                         # Fallback: Direct face detection for NVR cameras if pipeline fails
                         if self._frame_skip_counter % 5 == 0:  # Even less frequent for fallback
                             faces = self.face_detector.detect_faces(frame)
                             if faces:
-                                print(f"Direct NVR detection: Found {len(faces)} faces")
+                                # Direct NVR detection completed - removed verbose logging
+                                pass
                             
                             # Draw faces directly
                             frame = self.face_detector.draw_faces(frame, faces)
@@ -423,14 +482,25 @@ class AttendanceMarkingDialog:
                     # Resize frame for display
                     display_frame = cv2.resize(frame, (500, 400))
                     
-                    # Convert frame for display
-                    frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    frame_pil = Image.fromarray(frame_rgb)
-                    frame_tk = ImageTk.PhotoImage(frame_pil)
-                    
-                    # Update display
-                    self.camera_label.config(image=frame_tk, text="")
-                    self.camera_label.image = frame_tk
+                    # Convert frame for display using Canvas
+                    try:
+                        frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                        frame_pil = Image.fromarray(frame_rgb)
+                        frame_tk = ImageTk.PhotoImage(frame_pil)
+                        
+                        # Clear canvas and display image
+                        self.camera_canvas.delete('all')
+                        self.camera_canvas.create_image(250, 200, image=frame_tk, anchor=tk.CENTER)
+                        self.camera_canvas.image = frame_tk  # Keep reference to prevent garbage collection
+                        
+                        # Force canvas update
+                        self.camera_canvas.update_idletasks()
+                        
+                    except Exception as img_error:
+                        # Fallback: show text on canvas
+                        self.camera_canvas.delete('all')
+                        self.camera_canvas.create_text(250, 200, text=f"Camera Active\nFrame: {frame.shape}", 
+                                                      fill='green', font=('Arial', 12), tags='status_text')
                     
                     self.current_frame = frame
                 else:
@@ -440,7 +510,9 @@ class AttendanceMarkingDialog:
                     self._no_feed_count += 1
                     
                     if self._no_feed_count > 15:  # Increased threshold for more stability
-                        self.camera_label.config(text="No camera feed")
+                        self.camera_canvas.delete('all')
+                        self.camera_canvas.create_text(250, 200, text="No camera feed", 
+                                                      fill='red', font=('Arial', 12), tags='status_text')
                         self.status_label.config(text="Status: No camera feed", foreground='red')
             else:
                 # Camera not available, try to reinitialize much less frequently
@@ -473,7 +545,9 @@ class AttendanceMarkingDialog:
             
         except Exception as e:
             print(f"Error updating camera preview: {e}")
-            self.camera_label.config(text=f"Camera error: {str(e)}")
+            self.camera_canvas.delete('all')
+            self.camera_canvas.create_text(250, 200, text=f"Camera error: {str(e)}", 
+                                          fill='red', font=('Arial', 12), tags='status_text')
             self.status_label.config(text=f"Status: Error - {str(e)}", foreground='red')
             self.dialog.after(1000, self._update_camera_preview)
     
@@ -569,7 +643,8 @@ class AttendanceMarkingDialog:
                     x, y, w, h, conf = face
                     print(f"  Face {i}: bbox=({x},{y},{w},{h}), confidence={conf:.3f}")
             else:
-                print("No faces detected in current frame")
+                # No faces detected - removed verbose logging
+                pass
             
             if not faces:
                 return
@@ -637,12 +712,27 @@ class AttendanceMarkingDialog:
                 print("Face embedder not initialized")
                 return None
             
-            # Get recognition threshold from config or UI
+            # Get recognition threshold using threshold tuner
             ui_threshold = self.threshold_var.get()
             config_threshold = self.config.get('recognition_confidence', 0.80)
             
-            # Use balanced threshold for better performance - CONSISTENT THRESHOLD
-            recognition_threshold = max(ui_threshold, config_threshold, 0.75)  # Lowered minimum to 0.75
+            # Determine embedder type for threshold selection
+            embedder_type = 'standard_face'  # Default
+            if hasattr(self.face_embedder, '__class__'):
+                if 'InsightFace' in self.face_embedder.__class__.__name__:
+                    embedder_type = 'insightface'
+                elif 'Standard' in self.face_embedder.__class__.__name__:
+                    embedder_type = 'standard_face'
+                elif 'FaceNet' in self.face_embedder.__class__.__name__:
+                    embedder_type = 'facenet'
+                elif 'Simple' in self.face_embedder.__class__.__name__:
+                    embedder_type = 'simple'
+            
+            # Get dynamic threshold for this embedder
+            dynamic_threshold = self.threshold_tuner.get_threshold_for_embedder(embedder_type)
+            
+            # Use the highest threshold for safety
+            recognition_threshold = max(ui_threshold, config_threshold, dynamic_threshold)
             
             print(f"Using UI threshold: {ui_threshold:.2f}, config threshold: {config_threshold:.2f}, final threshold: {recognition_threshold:.2f}")
             print(f"Comparing against {len(self.student_encodings)} students")
@@ -679,17 +769,36 @@ class AttendanceMarkingDialog:
             
             print(f"Final result: best_similarity={best_similarity:.4f}, best_student_id={best_student_id}")
             
+            # Calculate gap between best and second best (needed for all logic paths)
+            second_best = 0.0
+            for student_id, enc_idx, sim in sorted(all_similarities, key=lambda x: x[2], reverse=True)[1:3]:
+                if sim > second_best:
+                    second_best = sim
+            
+            gap = best_similarity - second_best
+            min_gap = self.config.get('min_confidence_gap', 0.05)  # Increased to 0.05 for better discrimination
+            
+            # SPECIAL CHECK: Handle known problematic pairs
+            if best_student_id in ['1233', '52856'] and best_similarity > 0.90:
+                # Check if the second best is the other problematic student
+                second_best_student = None
+                second_best_similarity = 0.0
+                
+                for student_id, enc_idx, sim in sorted(all_similarities, key=lambda x: x[2], reverse=True)[1:3]:
+                    if sim > second_best_similarity and student_id != best_student_id:
+                        second_best_similarity = sim
+                        second_best_student = student_id
+                
+                # If second best is the other problematic student and gap is small, reject
+                if (second_best_student in ['1233', '52856'] and 
+                    best_similarity - second_best_similarity < 0.10):
+                    print(f"⚠️  PROBLEMATIC PAIR DETECTED: {best_student_id} vs {second_best_student}")
+                    print(f"⚠️  Similarity gap too small: {best_similarity:.4f} - {second_best_similarity:.4f} = {best_similarity - second_best_similarity:.4f}")
+                    print(f"⚠️  REJECTING MATCH - This face will be marked as UNKNOWN")
+                    return None
+            
             # QUALITY CHECK: Accept matches above threshold, or best match if no one meets threshold
             if best_similarity >= recognition_threshold:
-                # Additional check: Ensure this is a clear, unambiguous match
-                second_best = 0.0
-                for student_id, enc_idx, sim in sorted(all_similarities, key=lambda x: x[2], reverse=True)[1:3]:
-                    if sim > second_best:
-                        second_best = sim
-                
-                # Calculate gap between best and second best
-                gap = best_similarity - second_best
-                min_gap = self.config.get('min_confidence_gap', 0.01)  # Reduced from 0.02 to 0.01
                 
                 # BALANCED LOGIC: Require good confidence with reasonable gap
                 if best_similarity >= recognition_threshold and gap >= min_gap:
@@ -726,12 +835,14 @@ class AttendanceMarkingDialog:
                     return None
             else:
                 # Fallback: If best match is below threshold but still reasonable, accept it with lower confidence
-                if best_similarity >= 0.70:  # Lower threshold for fallback
-                    print(f"⚠️  FALLBACK MATCH: Best similarity {best_similarity:.4f} below threshold {recognition_threshold:.2f} but above 0.70")
+                # But only if there's a clear gap between best and second best
+                if best_similarity >= 0.80 and gap >= 0.03:  # Higher fallback threshold with gap requirement
+                    print(f"⚠️  FALLBACK MATCH: Best similarity {best_similarity:.4f} below threshold {recognition_threshold:.2f} but above 0.80 with gap {gap:.3f}")
                     print(f"⚠️  ACCEPTING FALLBACK MATCH: {best_student_id} with similarity {best_similarity:.4f}")
                     return best_student_id, best_similarity
                 else:
                     print(f"✗ NO MATCH: Best similarity {best_similarity:.4f} below recognition threshold {recognition_threshold:.2f}")
+                    print(f"✗ NO MATCH: Gap {gap:.3f} insufficient for reliable discrimination")
                     print(f"✗ NO MATCH: This face will be marked as UNKNOWN")
                     return None
             

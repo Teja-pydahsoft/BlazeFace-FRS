@@ -397,7 +397,8 @@ class MainDashboard:
         """Open student registration dialog"""
         try:
             from .student_registration import StudentRegistrationDialog
-            dialog = StudentRegistrationDialog(self.root, self.database_manager, self.config)
+            # Pass the existing camera manager to avoid conflicts
+            dialog = StudentRegistrationDialog(self.root, self.database_manager, self.config, self.camera_manager)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open student registration: {str(e)}")
     
