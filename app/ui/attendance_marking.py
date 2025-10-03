@@ -35,12 +35,12 @@ class AttendanceMarkingDialog:
         self.database_manager = database_manager
         self.config = config
         
-        # Initialize components
+    # Initialize components
         camera_source = config.get('camera_sources', {}).get('webcam', config.get('camera_index', 0))
         self.camera_manager = CameraManager(camera_source)
         self.face_detector = BlazeFaceDetector(min_detection_confidence=0.7)  # Higher threshold for better accuracy
         self.pipeline = None
-        self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')  # Always use ArcFace/InsightFace
+        self.face_embedder = None  # will be selected to match DB encodings
         
         # Initialize threshold tuner and face tracker
         self.threshold_tuner = ThresholdTuner(config, database_manager)
@@ -56,10 +56,21 @@ class AttendanceMarkingDialog:
         self.attendance_marked = set()  # Set of student_ids already marked today
         self.student_names = {}  # Cache student names for quick lookup
         self.tracked_face_data = {}  # Stores recognition data for tracked faces
+        # Consensus settings for auto-marking (N of M)
+        # Example: require 3 consistent recognitions out of last 4 frames
+        self.consensus_required = self.config.get('consensus_required', 3)
+        self.consensus_window = self.config.get('consensus_window', 4)
         
         # Recognition consistency tracking
         self.last_recognition_result = None  # (student_id, confidence, timestamp)
         self.recognition_consistency_threshold = 0.05  # 5% variation allowed
+        # Per-embedder recognition thresholds (can be overridden via config)
+        # Example: {'insightface': 0.6, 'standard': 0.55, 'simple': 0.5}
+        self.recognition_thresholds = config.get('recognition_thresholds', {
+            'insightface': 0.6,
+            'standard': 0.55,
+            'simple': 0.5
+        })
         
         # Create dialog window
         self.dialog = tk.Toplevel(parent)
@@ -76,6 +87,9 @@ class AttendanceMarkingDialog:
         
         # Load existing face encodings
         self._load_face_encodings()
+
+        # Initialize embedder after loading encodings so we pick one matching stored types
+        self._initialize_face_embedder()
         
         # Load today's attendance
         self._load_todays_attendance()
@@ -258,19 +272,49 @@ class AttendanceMarkingDialog:
         self._load_todays_attendance()
     
     def _initialize_face_embedder(self):
-        # Always use InsightFaceEmbedder for all recognition
+        # Choose the embedder to match the database stored encodings to avoid dim mismatch.
         try:
-            self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')
-            print("InsightFaceEmbedder (ArcFace) initialized for all recognition and matching")
+            # Inspect DB encoding types
+            rows = self.database_manager.get_face_encodings()
+            type_counts = {}
+            for _sid, _enc, enc_type, _img in rows:
+                t = enc_type or 'insightface'
+                type_counts[t] = type_counts.get(t, 0) + 1
+
+            preferred = None
+            if type_counts:
+                # Pick the most common stored encoding type
+                preferred = max(type_counts.items(), key=lambda x: x[1])[0]
+
+            if preferred == 'standard':
+                try:
+                    from app.core.standard_face_embedder import StandardFaceEmbedder
+                    self.face_embedder = StandardFaceEmbedder(model='large')
+                    print("StandardFaceEmbedder selected to match DB (128-dim)")
+                    return
+                except Exception as e:
+                    print(f"StandardFaceEmbedder init failed, falling back to InsightFace: {e}")
+
+            # Default: use InsightFace
+            try:
+                self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')
+                print("InsightFaceEmbedder (ArcFace) initialized for recognition and matching")
+            except Exception as e:
+                print(f"InsightFaceEmbedder failed: {e}")
+                self.face_embedder = None
         except Exception as e:
-            print(f"InsightFaceEmbedder failed: {e}")
-            self.face_embedder = None
+            print(f"Error selecting embedder: {e}")
+            try:
+                self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')
+            except Exception:
+                self.face_embedder = None
     
     def _load_face_encodings(self):
         """Load face encodings from database"""
         try:
             self.face_encodings = self.database_manager.get_face_encodings()
-            self.student_encodings = {}  # student_id -> list of encodings
+            # student_id -> list of {'encoding': np.ndarray, 'encoding_type': str, 'image_path': str}
+            self.student_encodings = {}
             self.student_names = {}  # student_id -> name
             
             for student_id, encoding, encoding_type, image_path in self.face_encodings:
@@ -282,22 +326,37 @@ class AttendanceMarkingDialog:
                         self.student_names[student_id] = student_info['name']
                     else:
                         self.student_names[student_id] = f"Student {student_id}"
-                self.student_encodings[student_id].append(encoding)
+                # Normalize and ensure dtype
+                try:
+                    if isinstance(encoding, np.ndarray):
+                        enc_arr = encoding.astype(np.float32)
+                    else:
+                        enc_arr = np.asarray(encoding, dtype=np.float32)
+                except Exception:
+                    enc_arr = np.array(encoding, dtype=np.float32)
+
+                self.student_encodings[student_id].append({
+                    'encoding': enc_arr,
+                    'encoding_type': encoding_type or 'insightface',
+                    'image_path': image_path
+                })
             
             print(f"Loaded {len(self.face_encodings)} face encodings for {len(self.student_encodings)} students")
             
             # Debug: Show loaded encodings
-            for student_id, encodings in self.student_encodings.items():
-                print(f"  Student {student_id}: {len(encodings)} encodings")
-                for i, encoding in enumerate(encodings):
-                    print(f"    Encoding {i}: shape={encoding.shape}, norm={np.linalg.norm(encoding):.4f}")
+            for student_id, enc_list in self.student_encodings.items():
+                print(f"  Student {student_id}: {len(enc_list)} encodings")
+                for i, enc_obj in enumerate(enc_list):
+                    encoding = enc_obj['encoding']
+                    enc_type = enc_obj.get('encoding_type', 'insightface')
+                    print(f"    Encoding {i} (type={enc_type}): shape={encoding.shape}, norm={np.linalg.norm(encoding):.4f}")
                     print(f"    Encoding {i}: sample values={encoding[:5]}")
                 
                 # Check if encodings are different
-                if len(encodings) > 1:
+                if len(enc_list) > 1:
                     from app.core.simple_face_embedder import SimpleFaceEmbedder
                     embedder = SimpleFaceEmbedder()
-                    is_same, similarity = embedder.compare_faces(encodings[0], encodings[1], 0.9)
+                    is_same, similarity = embedder.compare_faces(enc_list[0]['encoding'], enc_list[1]['encoding'], 0.9)
                     print(f"    Student {student_id}: Encoding 0 vs 1: is_same={is_same}, similarity={similarity:.4f}")
             
         except Exception as e:
@@ -587,7 +646,16 @@ class AttendanceMarkingDialog:
             tracked_objects = self.face_tracker.update(rects)
 
             for (object_id, centroid) in tracked_objects.items():
-                if object_id not in self.tracked_face_data or self.tracked_face_data[object_id]['student_id'] is None:
+                # Ensure tracked_face_data has a recognition history buffer
+                if object_id not in self.tracked_face_data:
+                    self.tracked_face_data[object_id] = {
+                        'student_id': None,
+                        'confidence': 0.0,
+                        'last_seen': time.time(),
+                        'history': []  # list of (student_id, confidence, timestamp)
+                    }
+
+                if self.tracked_face_data[object_id]['student_id'] is None:
                     
                     best_face_idx = -1
                     min_dist = float('inf')
@@ -611,20 +679,30 @@ class AttendanceMarkingDialog:
                             if best_match:
                                 student_id, recognition_confidence = best_match
                                 print(f"Tracker ID {object_id}: Matched student {student_id} with confidence {recognition_confidence:.4f}")
+                                # Append to recognition history for consensus
+                                hist = self.tracked_face_data[object_id].get('history', [])
+                                hist.append((student_id, recognition_confidence, time.time()))
+                                # Trim history to window
+                                hist = hist[-self.consensus_window:]
+                                self.tracked_face_data[object_id]['history'] = hist
+
+                                # Try consensus-based auto-mark
                                 if self.auto_mark_var.get():
-                                    self._mark_attendance(student_id, recognition_confidence)
+                                    self._try_consensus_mark(object_id)
                             else:
                                 print(f"Tracker ID {object_id}: No match found.")
-
-                            self.tracked_face_data[object_id] = {
-                                'student_id': student_id,
-                                'confidence': recognition_confidence,
-                                'last_seen': time.time()
-                            }
+                            # Update last_seen and keep stored student_id/confidence for display
+                            self.tracked_face_data[object_id]['last_seen'] = time.time()
+                            self.tracked_face_data[object_id]['student_id'] = student_id
+                            self.tracked_face_data[object_id]['confidence'] = recognition_confidence
                         else:
-                            self.tracked_face_data[object_id] = {'student_id': None, 'confidence': 0.0, 'last_seen': time.time()}
+                            self.tracked_face_data[object_id]['last_seen'] = time.time()
+                            self.tracked_face_data[object_id]['student_id'] = None
+                            self.tracked_face_data[object_id]['confidence'] = 0.0
                     else:
-                        self.tracked_face_data[object_id] = {'student_id': None, 'confidence': 0.0, 'last_seen': time.time()}
+                        self.tracked_face_data[object_id]['last_seen'] = time.time()
+                        self.tracked_face_data[object_id]['student_id'] = None
+                        self.tracked_face_data[object_id]['confidence'] = 0.0
                 else:
                     self.tracked_face_data[object_id]['last_seen'] = time.time()
 
@@ -650,27 +728,39 @@ class AttendanceMarkingDialog:
                 print("Face embedder not initialized")
                 return None
             
-            # Always use standard_face embedder and threshold 0.6
-            recognition_threshold = 0.6
-            print(f"Using fixed recognition threshold: {recognition_threshold:.2f}")
+            # We'll compute similarity across stored encodings and pick best match.
+            # Recognition acceptance uses the encoding_type of the best-matching stored encoding and
+            # applies per-embedder threshold from `self.recognition_thresholds`.
             print(f"Comparing against {len(self.student_encodings)} students")
             
             best_similarity = 0.0
             best_student_id = None
-            all_similarities = []  # Track all similarities for debugging
+            best_encoding_type = None
+            all_similarities = []  # Track all similarities for debugging (student_id, enc_idx, sim, encoding_type)
             
-            for student_id, encodings in self.student_encodings.items():
-                print(f"Checking student {student_id} with {len(encodings)} encodings")
+            for student_id, enc_list in self.student_encodings.items():
+                print(f"Checking student {student_id} with {len(enc_list)} encodings")
                 student_max_similarity = 0.0
                 
-                for i, encoding in enumerate(encodings):
-                    # Use very low threshold to get actual similarity scores
+                for i, enc_obj in enumerate(enc_list):
+                    encoding = enc_obj.get('encoding')
+                    enc_type = enc_obj.get('encoding_type', 'insightface')
+
+                    # Skip if encoding dims don't match query
+                    try:
+                        if encoding is None or encoding.ndim != 1 or encoding.shape[0] != query_embedding.shape[0]:
+                            print(f"  Skipping encoding {i} for student {student_id}: shape mismatch (stored={None if encoding is None else encoding.shape}, query={query_embedding.shape})")
+                            continue
+                    except Exception:
+                        continue
+
+                    # Use compare_faces to get similarity (we pass very low threshold to obtain the raw score)
                     is_same, similarity = self.face_embedder.compare_faces(query_embedding, encoding, 0.01)
-                    all_similarities.append((student_id, i, similarity))
+                    all_similarities.append((student_id, i, similarity, enc_type))
                     # Track the highest similarity for this student
                     if similarity > student_max_similarity:
                         student_max_similarity = similarity
-                    print(f"  Encoding {i}: similarity={similarity:.4f}")
+                    print(f"  Encoding {i} (type={enc_type}): similarity={similarity:.4f}")
                 
                 print(f"  Student {student_id} max similarity: {student_max_similarity:.4f}")
                 
@@ -678,18 +768,28 @@ class AttendanceMarkingDialog:
                 if student_max_similarity > best_similarity:
                     best_similarity = student_max_similarity
                     best_student_id = student_id
-                    print(f"  -> New best match: {student_id} with similarity {student_max_similarity:.4f}")
+                    # find which encoding produced the student_max_similarity to know its encoding_type
+                    # search all_similarities for that student
+                    best_enc_type = None
+                    for sid, enc_idx, sim, enc_type in all_similarities:
+                        if sid == student_id and abs(sim - student_max_similarity) < 1e-6:
+                            best_enc_type = enc_type
+                            break
+                    best_encoding_type = best_enc_type or 'insightface'
+                    print(f"  -> New best match: {student_id} with similarity {student_max_similarity:.4f} (encoding_type={best_encoding_type})")
             
             # Debug: Show all similarities
             print("All similarities:")
-            for student_id, enc_idx, sim in sorted(all_similarities, key=lambda x: x[2], reverse=True)[:5]:
-                print(f"  {student_id}[{enc_idx}]: {sim:.4f}")
+            for entry in sorted(all_similarities, key=lambda x: x[2], reverse=True)[:5]:
+                student_id, enc_idx, sim, enc_type = entry
+                print(f"  {student_id}[{enc_idx}] ({enc_type}): {sim:.4f}")
             
             print(f"Final result: best_similarity={best_similarity:.4f}, best_student_id={best_student_id}")
             
             # Calculate gap between best and second best (needed for all logic paths)
             second_best = 0.0
-            for student_id, enc_idx, sim in sorted(all_similarities, key=lambda x: x[2], reverse=True)[1:3]:
+            for entry in sorted(all_similarities, key=lambda x: x[2], reverse=True)[1:3]:
+                _, _, sim, _ = entry
                 if sim > second_best:
                     second_best = sim
             
@@ -702,7 +802,7 @@ class AttendanceMarkingDialog:
                 second_best_student = None
                 second_best_similarity = 0.0
                 
-                for student_id, enc_idx, sim in sorted(all_similarities, key=lambda x: x[2], reverse=True)[1:3]:
+                for student_id, enc_idx, sim, _ in sorted(all_similarities, key=lambda x: x[2], reverse=True)[1:3]:
                     if sim > second_best_similarity and student_id != best_student_id:
                         second_best_similarity = sim
                         second_best_student = student_id
@@ -715,7 +815,15 @@ class AttendanceMarkingDialog:
                     print(f"⚠️  REJECTING MATCH - This face will be marked as UNKNOWN")
                     return None
             
-            # QUALITY CHECK: Accept matches above threshold, or best match if no one meets threshold
+            # Determine recognition threshold based on encoding type of best match
+            if best_encoding_type:
+                recognition_threshold = self.recognition_thresholds.get(best_encoding_type, self.config.get('recognition_confidence', 0.6))
+            else:
+                recognition_threshold = self.config.get('recognition_confidence', 0.6)
+
+            print(f"Using recognition threshold for encoding '{best_encoding_type}': {recognition_threshold:.2f}")
+
+            # QUALITY CHECK: Accept matches above threshold, or best match if no one meets threshold (fallback handled later)
             if best_similarity >= recognition_threshold:
                 
                 # SMART GAP LOGIC: Adjust gap requirement based on number of students
@@ -737,29 +845,40 @@ class AttendanceMarkingDialog:
                         time_diff = current_time - last_time
                         
                         # If recognition happened recently (within 1 second) and results are inconsistent
-                        if time_diff < 1.0:  # Reduced from 2.0 to 1.0 seconds
+                        if time_diff < 1.0:  # 1.0 seconds
                             if last_student_id != best_student_id:
-                                # Only reject if confidence difference is very large (similar students can have close scores)
+                                # Only reject if confidence difference is very large
                                 confidence_diff = abs(best_similarity - last_confidence)
-                                if confidence_diff > 0.1:  # Only reject if difference > 0.1
-                                    print(f"⚠️  INCONSISTENT RECOGNITION: Last result was {last_student_id} ({last_confidence:.4f}), now {best_student_id} ({best_similarity:.4f})")
-                                    print(f"⚠️  REJECTING INCONSISTENT MATCH - This face will be marked as UNKNOWN")
+                                if confidence_diff > 0.1:
+                                    print(f"\u26a0\ufe0f  INCONSISTENT RECOGNITION: Last result was {last_student_id} ({last_confidence:.4f}), now {best_student_id} ({best_similarity:.4f})")
+                                    print(f"\u26a0\ufe0f  REJECTING INCONSISTENT MATCH - This face will be marked as UNKNOWN")
                                     return None
                                 else:
-                                    print(f"ℹ️  SIMILAR STUDENTS: Switching from {last_student_id} to {best_student_id} (diff: {confidence_diff:.4f})")
+                                    print(f"\u2139\ufe0f  SIMILAR STUDENTS: Switching from {last_student_id} to {best_student_id} (diff: {confidence_diff:.4f})")
                             elif abs(best_similarity - last_confidence) > self.recognition_consistency_threshold:
-                                print(f"⚠️  CONFIDENCE VARIATION: Last {last_confidence:.4f}, now {best_similarity:.4f} (diff: {abs(best_similarity - last_confidence):.4f})")
-                                print(f"⚠️  REJECTING VARIABLE MATCH - This face will be marked as UNKNOWN")
+                                print(f"\u26a0\ufe0f  CONFIDENCE VARIATION: Last {last_confidence:.4f}, now {best_similarity:.4f} (diff: {abs(best_similarity - last_confidence):.4f})")
+                                print(f"\u26a0\ufe0f  REJECTING VARIABLE MATCH - This face will be marked as UNKNOWN")
                                 return None
                     
                     # Store this recognition result for consistency checking
                     self.last_recognition_result = (best_student_id, best_similarity, current_time)
                     
-                    print(f"✓ CLEAR MATCH FOUND: {best_student_id} with similarity {best_similarity:.4f} (gap: {gap:.4f})")
+                    print(f"\u2713 CLEAR MATCH FOUND: {best_student_id} with similarity {best_similarity:.4f} (gap: {gap:.4f})")
                     return best_student_id, best_similarity
                 else:
-                    print(f"✗ INSUFFICIENT CONFIDENCE: {best_similarity:.4f} < {recognition_threshold:.2f} OR gap {gap:.4f} < {gap_required:.3f}")
-                    print(f"✗ REJECTING MATCH - This face will be marked as UNKNOWN")
+                    print(f"\u2717 INSUFFICIENT CONFIDENCE: {best_similarity:.4f} < {recognition_threshold:.2f} OR gap {gap:.4f} < {gap_required:.3f}")
+                    # Tightened fallback: accept only if best_similarity >= fallback_min and gap >= fallback_gap and
+                    # the best_encoding_type permits fallback (configurable). Default: no fallback.
+                    fallback_min = self.config.get('fallback_min_similarity', None)
+                    fallback_allowed_types = self.config.get('fallback_allowed_encoding_types', [])
+
+                    if fallback_min is not None and best_similarity >= fallback_min and gap >= (self.config.get('fallback_min_gap', 0.03)):
+                        if not fallback_allowed_types or (best_encoding_type in fallback_allowed_types):
+                            print(f"\u26a0\ufe0f  FALLBACK MATCH ACCEPTED (type={best_encoding_type}) with similarity {best_similarity:.4f}")
+                            # store recognition
+                            self.last_recognition_result = (best_student_id, best_similarity, time.time())
+                            return best_student_id, best_similarity
+                    print(f"\u2717 REJECTING MATCH - This face will be marked as UNKNOWN")
                     return None
             else:
                 # Fallback: If best match is below threshold but still reasonable, accept it with lower confidence
@@ -858,6 +977,50 @@ class AttendanceMarkingDialog:
             traceback.print_exc()
             self._log_message(f"✗ Error marking attendance: {str(e)}")
     
+    def _try_consensus_mark(self, object_id: int):
+        """Try to mark attendance for a tracked object if N-of-M consensus is met."""
+        try:
+            data = self.tracked_face_data.get(object_id)
+            if not data:
+                return
+
+            history = data.get('history', [])
+            if not history:
+                return
+
+            # Count votes for top student_id in history window
+            counts = {}
+            for sid, conf, ts in history:
+                if sid is None:
+                    continue
+                counts[sid] = counts.get(sid, 0) + 1
+
+            if not counts:
+                return
+
+            # Find best voted student and its count
+            best_student_id, votes = max(counts.items(), key=lambda x: x[1])
+            if votes >= self.consensus_required:
+                # Find latest confidence for that student in history
+                latest_conf = 0.0
+                for sid, conf, ts in reversed(history):
+                    if sid == best_student_id:
+                        latest_conf = conf
+                        break
+
+                # Confirm not already marked today
+                if best_student_id in self.attendance_marked:
+                    print(f"Student {best_student_id} already marked today (consensus).")
+                    return
+
+                print(f"Consensus reached for tracker {object_id}: {best_student_id} with {votes}/{len(history)} votes")
+                self._mark_attendance(best_student_id, latest_conf)
+
+        except Exception as e:
+            print(f"Error in consensus marking: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _update_recognition_display(self):
         """Update the recognition information display"""
         try:
@@ -1006,7 +1169,11 @@ class AttendanceMarkingDialog:
                 best_student_id = None
                 
                 for student_id, encodings in self.student_encodings.items():
-                    for stored_encoding in encodings:
+                    for stored_obj in encodings:
+                        stored_encoding = stored_obj.get('encoding')
+                        # Skip mismatched dims
+                        if stored_encoding is None or stored_encoding.shape[0] != embedding.shape[0]:
+                            continue
                         is_same, similarity = self.face_embedder.compare_faces(embedding, stored_encoding, threshold)
                         if is_same and similarity > best_confidence:
                             best_confidence = similarity
@@ -1172,8 +1339,14 @@ class AttendanceMarkingDialog:
             print(f"[DEBUG] Selected embedding for bbox {blaze_bbox} with IOU={best_iou:.2f}")
             best_student_id = None
             best_similarity = 0.0
-            for student_id, encodings in self.student_encodings.items():
-                for stored_encoding in encodings:
+            for student_id, enc_list in self.student_encodings.items():
+                for stored_obj in enc_list:
+                    stored_encoding = stored_obj.get('encoding')
+                    if stored_encoding is None:
+                        continue
+                    # Skip if dims don't match
+                    if stored_encoding.shape[0] != best_embedding.shape[0]:
+                        continue
                     similarity = np.dot(best_embedding, stored_encoding) / (np.linalg.norm(best_embedding) * np.linalg.norm(stored_encoding))
                     if similarity > best_similarity:
                         best_similarity = similarity

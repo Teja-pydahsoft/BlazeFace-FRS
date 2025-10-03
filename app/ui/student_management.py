@@ -309,7 +309,8 @@ class StudentManagementDialog:
     def _open_registration_dialog(self, student_id: str, student_name: str):
         """Open registration dialog for re-registration"""
         try:
-            from .student_registration import StudentRegistrationDialog
+            # Prefer the enhanced registration dialog by default for higher-quality registrations
+            from .enhanced_registration import EnhancedRegistrationDialog as StudentRegistrationDialog
             
             # Create config
             config = {

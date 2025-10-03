@@ -55,7 +55,24 @@ class InsightFaceEmbedder:
             Preprocessed face image
         """
         try:
-            # InsightFace expects BGR format, so no conversion needed
+            # InsightFace's FaceAnalysis expects images in RGB ordering (while OpenCV uses BGR).
+            # Many callers may already pass RGB (e.g., GUI code). To avoid double conversion
+            # we use a lightweight heuristic: compare channel means to guess ordering and
+            # convert only when the image appears to be in BGR order.
+            if face_image is None:
+                return None
+            if face_image.shape[2] == 3:
+                # Compute channel means
+                b_mean = float(face_image[..., 0].mean())
+                g_mean = float(face_image[..., 1].mean())
+                r_mean = float(face_image[..., 2].mean())
+                # Heuristic: if blue mean is noticeably larger than red mean, image likely BGR
+                if (b_mean - r_mean) > 5.0:
+                    face_image = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+                else:
+                    # assume already RGB (or nearly balanced), leave as-is
+                    pass
+            # Ensure minimum size
             # Ensure minimum size
             h, w = face_image.shape[:2]
             if h < 40 or w < 40:
@@ -63,6 +80,10 @@ class InsightFaceEmbedder:
                 scale = max(40 / h, 40 / w)
                 new_h, new_w = int(h * scale), int(w * scale)
                 face_image = cv2.resize(face_image, (new_w, new_h))
+
+            # Ensure correct dtype
+            if face_image.dtype != np.uint8:
+                face_image = (np.clip(face_image, 0, 255)).astype(np.uint8)
             
             return face_image
             
@@ -205,8 +226,12 @@ class InsightFaceEmbedder:
             List of tuples (face_info, face_encoding)
         """
         try:
+            # Preprocess image once (convert ordering/dtype/resize heuristics) before analysis
+            proc = self.preprocess_face(image)
+            if proc is None:
+                return []
             # Get face analysis
-            faces = self.app.get(image)
+            faces = self.app.get(proc)
             
             results = []
             for face in faces:

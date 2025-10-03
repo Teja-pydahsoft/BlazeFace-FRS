@@ -6,6 +6,7 @@ Handles student data, attendance records, and face encodings
 import sqlite3
 import json
 import numpy as np
+import io
 import os
 from typing import List, Dict, Any, Optional, Tuple
 import logging
@@ -276,7 +277,17 @@ class DatabaseManager:
                 cursor = conn.cursor()
 
                 for i, encoding in enumerate(encodings):
-                    encoding_bytes = encoding.tobytes()
+                    # Ensure encoding is a numpy array with dtype float32
+                    arr = np.asarray(encoding)
+                    if arr.dtype != np.float32:
+                        arr = arr.astype(np.float32)
+
+                    # Save array to bytes using numpy's binary format for safe roundtrip
+                    buf = io.BytesIO()
+                    # allow_pickle=False for safety
+                    np.save(buf, arr, allow_pickle=False)
+                    encoding_bytes = buf.getvalue()
+
                     image_path = image_paths[i] if image_paths and i < len(image_paths) else None
                     
                     cursor.execute("""
@@ -287,7 +298,7 @@ class DatabaseManager:
                 conn.commit()
                 self.logger.info(f"{len(encodings)} face encoding(s) added for student: {student_id}")
                 return True
-                
+
         except Exception as e:
             self.logger.error(f"Error adding face encodings: {str(e)}")
             return False
@@ -331,11 +342,24 @@ class DatabaseManager:
                 
                 for row in rows:
                     student_id, encoding_bytes, encoding_type, image_path = row
-                    encoding = np.frombuffer(encoding_bytes, dtype=np.float64)
-                    encodings.append((student_id, encoding, encoding_type, image_path))
+                    try:
+                        # Try to load using numpy binary format (new format)
+                        buf = io.BytesIO(encoding_bytes)
+                        arr = np.load(buf, allow_pickle=False)
+                    except Exception:
+                        # Fallback: older format may be raw bytes of float64; try to interpret
+                        try:
+                            arr = np.frombuffer(encoding_bytes, dtype=np.float64)
+                            # convert to float32 for consistency
+                            arr = arr.astype(np.float32)
+                        except Exception as e:
+                            self.logger.error(f"Failed to decode encoding for student {student_id}: {e}")
+                            continue
+
+                    encodings.append((student_id, arr, encoding_type, image_path))
                 
                 return encodings
-                
+
         except Exception as e:
             self.logger.error(f"Error getting face encodings: {str(e)}")
             return []

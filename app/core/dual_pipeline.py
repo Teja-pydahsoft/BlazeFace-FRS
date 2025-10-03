@@ -230,21 +230,56 @@ class DualPipeline:
                 self.logger.debug("Direct detection: No faces found")
             
             # Get face embeddings
-            embeddings = []
-            for i, face_box in enumerate(faces):
-                x, y, w, h, confidence = face_box
-                face_region = self.face_detector.extract_face_region(processing_frame, (x, y, w, h))
-                if face_region is not None:
-                    embedding = self.face_embedder.get_embedding(face_region)
-                    if embedding is not None:
-                        embeddings.append(embedding)
-                        self.logger.debug(f"Direct embedding: Face {i} got embedding with shape {embedding.shape}")
+            # Run InsightFace once on the full processing frame and map embeddings to detected boxes via IOU
+            embeddings = [None] * len(faces)
+            try:
+                # InsightFace expects RGB images in our codepaths; ensure conversion
+                proc_for_insight = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2RGB) if processing_frame.shape[2] == 3 else processing_frame
+                insight_results = self.face_embedder.detect_and_encode_faces(proc_for_insight)
+
+                # Convert insightface bboxes to [x1,y1,x2,y2] format and compute IOU matching
+                def to_xyxy(bbox):
+                    x1, y1, x2, y2 = bbox
+                    return [int(x1), int(y1), int(x2), int(y2)]
+
+                def iou(boxA, boxB):
+                    # boxA: x,y,w,h ; boxB: x1,y1,x2,y2
+                    ax, ay, aw, ah = boxA
+                    a1x, a1y, a2x, a2y = ax, ay, ax+aw, ay+ah
+                    bx1, by1, bx2, by2 = boxB
+                    xA = max(a1x, bx1)
+                    yA = max(a1y, by1)
+                    xB = min(a2x, bx2)
+                    yB = min(a2y, by2)
+                    interW = max(0, xB - xA)
+                    interH = max(0, yB - yA)
+                    interArea = interW * interH
+                    boxAArea = (a2x - a1x) * (a2y - a1y)
+                    boxBArea = (bx2 - bx1) * (by2 - by1)
+                    denom = float(boxAArea + boxBArea - interArea + 1e-6)
+                    return interArea / denom if denom > 0 else 0.0
+
+                used = set()
+                for i, face_box in enumerate(faces):
+                    best_iou = 0.0
+                    best_emb = None
+                    bx, by, bw, bh, conf = face_box
+                    for j, (face_info, embedding) in enumerate(insight_results):
+                        if embedding is None:
+                            continue
+                        b_xyxy = to_xyxy(face_info['bbox'])
+                        score = iou((bx, by, bw, bh), b_xyxy)
+                        if score > best_iou:
+                            best_iou = score
+                            best_emb = embedding
+                    # Accept embedding only if IOU reasonable
+                    if best_iou >= 0.3 and best_emb is not None:
+                        embeddings[i] = best_emb
+                        self.logger.debug(f"Direct embedding: Face {i} matched InsightFace embedding (IOU={best_iou:.2f})")
                     else:
-                        self.logger.debug(f"Direct embedding: Face {i} failed to get embedding")
-                        embeddings.append(None)
-                else:
-                    self.logger.debug(f"Direct embedding: Face {i} failed to extract face region")
-                    embeddings.append(None)
+                        self.logger.debug(f"Direct embedding: Face {i} had no matching InsightFace embedding (best IOU={best_iou:.2f})")
+            except Exception as e:
+                self.logger.debug(f"InsightFace mapping failed: {e}")
             
             # Detect humans
             humans = self.human_detector.detect_humans(processing_frame)
@@ -295,19 +330,52 @@ class DualPipeline:
                     self.logger.debug("No faces detected in frame")
                 
                 # Get face embeddings
-                embeddings = []
-                for i, face_box in enumerate(faces):
-                    x, y, w, h, confidence = face_box
-                    face_region = self.face_detector.extract_face_region(frame, (x, y, w, h))
-                    if face_region is not None:
-                        embedding = self.face_embedder.get_embedding(face_region)
-                        if embedding is not None:
-                            embeddings.append(embedding)
-                            self.logger.debug(f"Face {i}: Got embedding with shape {embedding.shape}")
+                # Run InsightFace once on the full frame and map embeddings to detected boxes
+                embeddings = [None] * len(faces)
+                try:
+                    proc_for_insight = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame.shape[2] == 3 else frame
+                    insight_results = self.face_embedder.detect_and_encode_faces(proc_for_insight)
+
+                    # Same IOU mapping as in direct processing
+                    def to_xyxy(bbox):
+                        x1, y1, x2, y2 = bbox
+                        return [int(x1), int(y1), int(x2), int(y2)]
+
+                    def iou(boxA, boxB):
+                        ax, ay, aw, ah = boxA
+                        a1x, a1y, a2x, a2y = ax, ay, ax+aw, ay+ah
+                        bx1, by1, bx2, by2 = boxB
+                        xA = max(a1x, bx1)
+                        yA = max(a1y, by1)
+                        xB = min(a2x, bx2)
+                        yB = min(a2y, by2)
+                        interW = max(0, xB - xA)
+                        interH = max(0, yB - yA)
+                        interArea = interW * interH
+                        boxAArea = (a2x - a1x) * (a2y - a1y)
+                        boxBArea = (bx2 - bx1) * (by2 - by1)
+                        denom = float(boxAArea + boxBArea - interArea + 1e-6)
+                        return interArea / denom if denom > 0 else 0.0
+
+                    for i, face_box in enumerate(faces):
+                        best_iou = 0.0
+                        best_emb = None
+                        bx, by, bw, bh, conf = face_box
+                        for j, (face_info, embedding) in enumerate(insight_results):
+                            if embedding is None:
+                                continue
+                            b_xyxy = to_xyxy(face_info['bbox'])
+                            score = iou((bx, by, bw, bh), b_xyxy)
+                            if score > best_iou:
+                                best_iou = score
+                                best_emb = embedding
+                        if best_iou >= 0.3 and best_emb is not None:
+                            embeddings[i] = best_emb
+                            self.logger.debug(f"Face {i}: Matched InsightFace embedding (IOU={best_iou:.2f})")
                         else:
-                            self.logger.debug(f"Face {i}: Failed to get embedding")
-                    else:
-                        self.logger.debug(f"Face {i}: Failed to extract face region")
+                            self.logger.debug(f"Face {i}: No matching InsightFace embedding (best IOU={best_iou:.2f})")
+                except Exception as e:
+                    self.logger.debug(f"InsightFace mapping failed in worker: {e}")
                 
                 # Update results
                 with self.lock:
