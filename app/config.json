@@ -10,13 +10,13 @@
         "video_file": "test_video.mp4"
     },
     "detection_confidence": 0.1,
-    "recognition_confidence": 0.6,
+    "recognition_confidence": 0.35,
     "min_confidence_gap": 0.05,
     "threshold_tuning": {
         "insightface_threshold": 0.5,
         "dlib_threshold": 0.6,
         "facenet_threshold": 0.6,
-        "simple_threshold": 0.8,
+        "simple_threshold": 0.35,
         "auto_tune_enabled": true,
         "validation_dataset_path": "validation_data/"
     },
@@ -24,7 +24,7 @@
     "facenet_model_path": "models/facenet_keras.h5",
     "human_detection_model_path": "models/mobilenet_ssd.tflite",
     "max_faces": 10,
-    "face_encoding_dimension": 128,
+    "face_encoding_dimension": 256,
     "embedder_preferences": {
         "primary": "insightface_embedder",
         "secondary": "standard_face_embedder",

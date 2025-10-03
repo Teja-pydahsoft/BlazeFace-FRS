@@ -103,6 +103,9 @@ class StudentManagementDialog:
         
         ttk.Button(left_buttons, text="Refresh List", 
                   command=self._refresh_students).pack(side=tk.LEFT, padx=(0, 5))
+
+        ttk.Button(left_buttons, text="Bulk Register",
+                  command=self._open_bulk_registration).pack(side=tk.LEFT, padx=(0, 5))
         
         ttk.Button(left_buttons, text="Delete Selected", 
                   command=self._delete_selected_student).pack(side=tk.LEFT, padx=(0, 5))
@@ -133,12 +136,15 @@ class StudentManagementDialog:
                 self.students_tree.delete(item)
             
             # Get all students
+            print("Loading students from database...")
             students = self.database_manager.get_all_students()
+            print(f"Found {len(students)} students in database")
             
             # Get face encoding counts for each student
             encodings = self.database_manager.get_face_encodings()
+            print(f"Found {len(encodings)} face encodings in database")
             encoding_counts = {}
-            for student_id, _, _ in encodings:
+            for student_id, _, _, _ in encodings:  # Fixed: unpack 4 values
                 encoding_counts[student_id] = encoding_counts.get(student_id, 0) + 1
             
             # Add students to treeview
@@ -170,7 +176,11 @@ class StudentManagementDialog:
             self.status_label.config(text=f"Loaded {len(students)} students")
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load students: {str(e)}")
+            error_msg = f"Failed to load students: {str(e)}"
+            print(f"ERROR: {error_msg}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", error_msg)
             self.status_label.config(text="Error loading students", foreground='red')
     
     def _refresh_students(self):
@@ -195,7 +205,7 @@ class StudentManagementDialog:
                                  f"Are you sure you want to delete student '{student_name}' (ID: {student_id})?\n\n"
                                  f"This will permanently remove:\n"
                                  f"- Student information\n"
-                                 f"- All face encodings\n"
+                                 f"- All face encodings (pickle-based)\n"
                                  f"- All attendance records"):
                 
                 # Delete student
@@ -226,13 +236,14 @@ class StudentManagementDialog:
                                  f"Are you sure you want to delete ALL {len(students)} students?\n\n"
                                  f"This will permanently remove:\n"
                                  f"- All student information\n"
-                                 f"- All face encodings\n"
+                                 f"- All face encodings (pickle-based)\n"
                                  f"- All attendance records\n\n"
                                  f"This action cannot be undone!"):
                 
                 # Delete all students
                 deleted_count = 0
                 for student in students:
+                    # Delete from database
                     success = self.database_manager.delete_student(student['student_id'])
                     if success:
                         deleted_count += 1
@@ -280,6 +291,20 @@ class StudentManagementDialog:
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to re-register student: {str(e)}")
+
+    def _open_bulk_registration(self):
+        """Open the bulk registration dialog"""
+        try:
+            from .bulk_registration_dialog import BulkRegistrationDialog
+            config = {
+                'face_data_path': 'face_data',
+                'models_path': 'models'
+            }
+            bulk_dialog = BulkRegistrationDialog(self.dialog, self.database_manager, config)
+            self.dialog.wait_window(bulk_dialog.dialog)
+            self._refresh_students()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open bulk registration: {str(e)}")
     
     def _open_registration_dialog(self, student_id: str, student_name: str):
         """Open registration dialog for re-registration"""

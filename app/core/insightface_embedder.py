@@ -30,7 +30,7 @@ class InsightFaceEmbedder:
         self.model_name = model_name
         self.providers = providers or ['CPUExecutionProvider']
         self.logger = logging.getLogger(__name__)
-        self.embedding_size = 512  # InsightFace typically uses 512-dimensional embeddings
+        self.embedding_size = 512  # InsightFace buffalo_l typically uses 512-dimensional embeddings
         
         # Initialize InsightFace app
         try:

@@ -13,7 +13,7 @@ class SimpleFaceEmbedder:
         """Initialize simple face embedder"""
         self.logger = logging.getLogger(__name__)
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        self.embedding_size = 128
+        self.embedding_size = 256  # Increased to match database encodings
         
     def preprocess_face(self, face_image: np.ndarray) -> np.ndarray:
         """
@@ -63,8 +63,8 @@ class SimpleFaceEmbedder:
             # Extract features using multiple methods
             features = []
             
-            # 1. Histogram features (more bins for better discrimination)
-            hist = cv2.calcHist([processed_face], [0], None, [64], [0, 1])
+            # 1. Histogram features (increased bins for 256-dimensional embeddings)
+            hist = cv2.calcHist([processed_face], [0], None, [128], [0, 1])
             features.extend(hist.flatten())
             
             # 2. LBP-like features (simplified)
@@ -141,11 +141,11 @@ class SimpleFaceEmbedder:
                         texture = np.var(region)
                         features.extend([mean_val, std_val, min_val, max_val, texture])
             
-            return np.array(features[:40])  # Limit to 40 features
+            return np.array(features[:64])  # Increased to 64 features for 256-dimensional embeddings
             
         except Exception as e:
             self.logger.error(f"Error extracting LBP features: {str(e)}")
-            return np.zeros(40)
+            return np.zeros(64)
     
     def _extract_region_features(self, image: np.ndarray) -> np.ndarray:
         """Extract features from image regions"""
@@ -162,7 +162,7 @@ class SimpleFaceEmbedder:
                         std_val = np.std(region)
                         features.extend([mean_val, std_val])
             
-            return np.array(features[:32])  # Limit to 32 features
+            return np.array(features[:32])  # Keep at 32 features
             
         except Exception as e:
             self.logger.error(f"Error extracting region features: {str(e)}")
@@ -251,19 +251,29 @@ class SimpleFaceEmbedder:
         """
         try:
             if embedding1 is None or embedding2 is None:
+                self.logger.warning("Comparing faces with None embedding")
                 return False, 0.0
             
+            # Ensure embeddings are numpy arrays
+            embedding1 = np.asarray(embedding1, dtype=np.float32)
+            embedding2 = np.asarray(embedding2, dtype=np.float32)
+
             # Calculate cosine similarity
             dot_product = np.dot(embedding1, embedding2)
             norm1 = np.linalg.norm(embedding1)
             norm2 = np.linalg.norm(embedding2)
             
+            self.logger.debug(f"compare_faces: dot_product={dot_product:.4f}, norm1={norm1:.4f}, norm2={norm2:.4f}")
+
             if norm1 == 0 or norm2 == 0:
+                self.logger.warning("One or both embeddings have zero norm")
                 return False, 0.0
             
             similarity = dot_product / (norm1 * norm2)
             is_same = similarity >= threshold
             
+            self.logger.debug(f"compare_faces: similarity={similarity:.4f}, is_same={is_same}")
+
             return is_same, similarity
             
         except Exception as e:

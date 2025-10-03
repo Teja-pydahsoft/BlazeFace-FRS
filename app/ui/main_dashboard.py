@@ -28,8 +28,10 @@ class MainDashboard:
         """
         self.root = root
         self.root.title("BlazeFace-FRS - Dual Detection System")
-        self.root.geometry("1400x900")
+        self.root.state('zoomed')
         self.root.configure(bg='#f0f0f0')
+        self.root.resizable(True, True) # Make the window resizable
+        self.root.minsize(1024, 768) # Set a minimum size for the window
         
         # Load configuration
         self.config = self._load_config()
@@ -394,11 +396,11 @@ class MainDashboard:
             print(f"Error logging message: {e}")
     
     def _open_student_registration(self):
-        """Open student registration dialog"""
+        """Open enhanced student registration dialog"""
         try:
-            from .student_registration import StudentRegistrationDialog
+            from .enhanced_registration import EnhancedRegistrationDialog
             # Pass the existing camera manager to avoid conflicts
-            dialog = StudentRegistrationDialog(self.root, self.database_manager, self.config, self.camera_manager)
+            dialog = EnhancedRegistrationDialog(self.root, self.database_manager, self.config, self.camera_manager)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open student registration: {str(e)}")
     
@@ -410,14 +412,6 @@ class MainDashboard:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open attendance marking: {str(e)}")
     
-    def _open_attendance_history(self):
-        """Open attendance history dialog"""
-        try:
-            from .attendance_history import AttendanceHistoryDialog
-            dialog = AttendanceHistoryDialog(self.root, self.database_manager)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open attendance history: {str(e)}")
-    
     def _open_student_management(self):
         """Open student management dialog"""
         try:
@@ -425,6 +419,14 @@ class MainDashboard:
             dialog = StudentManagementDialog(self.root, self.database_manager)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open student management: {str(e)}")
+    
+    def _open_attendance_history(self):
+        """Open attendance history dialog"""
+        try:
+            from .attendance_history import AttendanceHistoryDialog
+            dialog = AttendanceHistoryDialog(self.root, self.database_manager)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open attendance history: {str(e)}")
     
     def _open_settings(self):
         """Open settings dialog"""

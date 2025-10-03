@@ -14,13 +14,14 @@ class EncodingQualityChecker:
         
         # Quality thresholds
         self.min_similarity_with_existing = 0.70  # Minimum similarity with existing encodings of same person
-        self.max_similarity_with_others = 0.80    # Maximum similarity with encodings of different people
+        self.max_similarity_with_others = 0.60    # Maximum similarity with encodings of different people
+        self.duplicate_threshold = 0.85           # Threshold to detect potential duplicates
         self.min_encoding_quality = 0.60          # Minimum quality score for encoding
         self.max_encodings_per_person = 3         # Maximum encodings per person
     
     def check_new_encoding_quality(self, new_encoding: np.ndarray, 
                                  existing_encodings: List[np.ndarray],
-                                 other_people_encodings: List[np.ndarray],
+                                 other_people_encodings: List[Tuple[str, np.ndarray]],
                                  person_id: str) -> Tuple[bool, str, dict]:
         """
         Check if a new encoding meets quality standards
@@ -28,7 +29,7 @@ class EncodingQualityChecker:
         Args:
             new_encoding: The new encoding to check
             existing_encodings: Existing encodings for the same person
-            other_people_encodings: Encodings for other people
+            other_people_encodings: Encodings for other people as a list of (student_id, encoding)
             person_id: ID of the person being registered
             
         Returns:
@@ -71,11 +72,17 @@ class EncodingQualityChecker:
             # Check similarity with other people's encodings
             if other_people_encodings:
                 max_similarity = 0.0
-                for other_encoding in other_people_encodings:
+                most_similar_student = None
+                for other_student_id, other_encoding in other_people_encodings:
                     similarity = self._calculate_similarity(new_encoding, other_encoding)
-                    max_similarity = max(max_similarity, similarity)
+                    if similarity > max_similarity:
+                        max_similarity = similarity
+                        most_similar_student = other_student_id
                 
                 quality_metrics['max_similarity_with_others'] = max_similarity
+                
+                if max_similarity > self.duplicate_threshold:
+                    return False, f"Potential duplicate of student {most_similar_student} (similarity: {max_similarity:.2f})", quality_metrics
                 
                 if max_similarity > self.max_similarity_with_others:
                     return False, f"Too similar to other people: {max_similarity:.4f} > {self.max_similarity_with_others}", quality_metrics
@@ -115,7 +122,7 @@ class EncodingQualityChecker:
     
     def _calculate_quality_score(self, new_encoding: np.ndarray,
                                existing_encodings: List[np.ndarray],
-                               other_people_encodings: List[np.ndarray]) -> float:
+                               other_people_encodings: List[Tuple[str, np.ndarray]]) -> float:
         """Calculate overall quality score for an encoding"""
         try:
             score = 1.0
@@ -123,7 +130,7 @@ class EncodingQualityChecker:
             # Penalize if too similar to other people
             if other_people_encodings:
                 max_similarity = 0.0
-                for other_encoding in other_people_encodings:
+                for _, other_encoding in other_people_encodings:
                     similarity = self._calculate_similarity(new_encoding, other_encoding)
                     max_similarity = max(max_similarity, similarity)
                 

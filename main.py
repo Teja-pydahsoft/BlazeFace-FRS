@@ -82,6 +82,8 @@ def main():
         
         # Create and run the main application
         root = tk.Tk()
+        root.resizable(True, True) # Make the window resizable
+        root.minsize(800, 600) # Set a minimum size for the window
         
         # Set application icon if available
         try:

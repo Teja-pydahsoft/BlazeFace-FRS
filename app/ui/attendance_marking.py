@@ -18,6 +18,8 @@ from ..core.database import DatabaseManager
 from ..core.blazeface_detector import BlazeFaceDetector
 from ..core.threshold_tuner import ThresholdTuner
 from ..utils.camera_utils import CameraManager
+from .face_tracker import FaceTracker
+from ..core.insightface_embedder import InsightFaceEmbedder
 
 class AttendanceMarkingDialog:
     def __init__(self, parent, database_manager: DatabaseManager, config: Dict[str, Any]):
@@ -36,12 +38,13 @@ class AttendanceMarkingDialog:
         # Initialize components
         camera_source = config.get('camera_sources', {}).get('webcam', config.get('camera_index', 0))
         self.camera_manager = CameraManager(camera_source)
-        self.face_detector = BlazeFaceDetector(min_detection_confidence=0.3)  # Lower threshold for better detection
+        self.face_detector = BlazeFaceDetector(min_detection_confidence=0.7)  # Higher threshold for better accuracy
         self.pipeline = None
-        self.face_embedder = None
+        self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')  # Always use ArcFace/InsightFace
         
-        # Initialize threshold tuner
+        # Initialize threshold tuner and face tracker
         self.threshold_tuner = ThresholdTuner(config, database_manager)
+        self.face_tracker = FaceTracker(max_disappeared=10, max_distance=75)
         
         # Detect camera type for pipeline optimization
         self.camera_type = self._detect_camera_type(camera_source)
@@ -52,6 +55,7 @@ class AttendanceMarkingDialog:
         self.recognized_students = {}  # student_id -> (name, last_seen, confidence)
         self.attendance_marked = set()  # Set of student_ids already marked today
         self.student_names = {}  # Cache student names for quick lookup
+        self.tracked_face_data = {}  # Stores recognition data for tracked faces
         
         # Recognition consistency tracking
         self.last_recognition_result = None  # (student_id, confidence, timestamp)
@@ -69,9 +73,6 @@ class AttendanceMarkingDialog:
         
         # Setup UI
         self._setup_ui()
-        
-        # Initialize face embedder
-        self._initialize_face_embedder()
         
         # Load existing face encodings
         self._load_face_encodings()
@@ -139,8 +140,8 @@ class AttendanceMarkingDialog:
         
         # Recognition threshold (for face embedding similarity matching)
         ttk.Label(settings_frame, text="Recognition Threshold (face similarity):").pack(anchor=tk.W)
-        self.threshold_var = tk.DoubleVar(value=self.config.get('recognition_confidence', 0.80))
-        threshold_scale = ttk.Scale(settings_frame, from_=0.6, to=1.0, 
+        self.threshold_var = tk.DoubleVar(value=self.config.get('recognition_confidence', 0.35))
+        threshold_scale = ttk.Scale(settings_frame, from_=0.1, to=0.8, 
                                   variable=self.threshold_var, orient=tk.HORIZONTAL)
         threshold_scale.pack(fill=tk.X, pady=(0, 5))
         
@@ -257,36 +258,12 @@ class AttendanceMarkingDialog:
         self._load_todays_attendance()
     
     def _initialize_face_embedder(self):
-        """Initialize face embedder with best available option - InsightFace primary, dlib fallback"""
+        # Always use InsightFaceEmbedder for all recognition
         try:
-            # Try InsightFaceEmbedder first (ArcFace - highest accuracy)
-            try:
-                from ..core.insightface_embedder import InsightFaceEmbedder
-                self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')
-                print("InsightFaceEmbedder (ArcFace) initialized successfully as PRIMARY")
-            except Exception as e:
-                print(f"InsightFaceEmbedder failed, trying StandardFaceEmbedder: {e}")
-                # Fallback to StandardFaceEmbedder (dlib)
-                try:
-                    from ..core.standard_face_embedder import StandardFaceEmbedder
-                    self.face_embedder = StandardFaceEmbedder(model='large')
-                    print("StandardFaceEmbedder (face_recognition/dlib) initialized successfully as FALLBACK")
-                except Exception as e2:
-                    print(f"StandardFaceEmbedder failed, trying FaceNet: {e2}")
-                    # Fallback to FaceNet
-                    try:
-                        from ..core.facenet_embedder import FaceNetEmbedder
-                        facenet_model_path = self.config.get('facenet_model_path', 'models/facenet_keras.h5')
-                        self.face_embedder = FaceNetEmbedder(model_path=facenet_model_path)
-                        print("FaceNet embedder initialized successfully as FALLBACK")
-                    except Exception as e3:
-                        print(f"FaceNet embedder failed, using Simple embedder: {e3}")
-                        # Final fallback to Simple embedder
-                        from ..core.simple_face_embedder import SimpleFaceEmbedder
-                        self.face_embedder = SimpleFaceEmbedder()
-                        print("Simple face embedder initialized successfully as FINAL FALLBACK")
+            self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')
+            print("InsightFaceEmbedder (ArcFace) initialized for all recognition and matching")
         except Exception as e:
-            print(f"Error initializing face embedder: {e}")
+            print(f"InsightFaceEmbedder failed: {e}")
             self.face_embedder = None
     
     def _load_face_encodings(self):
@@ -552,154 +529,115 @@ class AttendanceMarkingDialog:
             self.dialog.after(1000, self._update_camera_preview)
     
     def _draw_enhanced_detections(self, frame: np.ndarray, results: Dict[str, Any]) -> np.ndarray:
-        """Draw enhanced detections with recognition status"""
+        """Draw enhanced detections using the face tracker's output."""
         try:
-            faces = results.get('faces', [])
-            embeddings = results.get('embeddings', [])
-            
-            if not faces:
-                return frame
-            
             result_frame = frame.copy()
             
-            # Process each detected face
-            for i, face_box in enumerate(faces):
-                x, y, w, h, confidence = face_box
+            # Use the tracker's current state to draw
+            for (object_id, centroid) in self.face_tracker.faces.items():
+                # Find the original bounding box for this centroid
+                best_rect = None
+                min_dist = float('inf')
+                for r in results.get('faces', []):
+                    x,y,w,h,conf = r
+                    cx, cy = x + w // 2, y + h // 2
+                    dist = np.sqrt((cx - centroid[0])**2 + (cy - centroid[1])**2)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_rect = (x,y,w,h)
+
+                if best_rect is None:
+                    continue
+
+                x, y, w, h = best_rect
                 
-                # Skip faces with low detection confidence
-                min_face_confidence = self.face_confidence_var.get()
-                if confidence < min_face_confidence:
-                    print(f"Face {i}: Skipping - low detection confidence {confidence:.2f} < {min_face_confidence:.2f}")
-                    # Draw red box for low confidence faces but still show them
-                    cv2.rectangle(result_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                    cv2.putText(result_frame, f"Face: {confidence:.2f}", 
-                               (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    cv2.putText(result_frame, f"Low Confidence (<{min_face_confidence:.1f})", 
-                               (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    # Don't continue - still process as unknown face
+                # Get recognition data from our tracked data store
+                track_data = self.tracked_face_data.get(object_id)
                 
-                # Get embedding for this face
-                embedding = None
-                if i < len(embeddings) and embeddings[i] is not None:
-                    embedding = embeddings[i]
-                
-                # Find best match
-                student_name = "Unknown Face"
+                student_name = "Unknown"
                 color = (0, 0, 255)  # Red for unknown
-                status_text = "Unknown Face"
                 
-                if embedding is not None:
-                    print(f"Face {i}: Processing recognition with confidence {confidence:.2f}")
-                    print(f"Face {i}: Embedding shape: {embedding.shape}, norm: {np.linalg.norm(embedding):.4f}")
-                    print(f"Face {i}: Available students: {list(self.student_encodings.keys())}")
-                    best_match = self._find_best_match(embedding)
-                    if best_match:
-                        student_id, match_confidence = best_match
-                        student_name = self.student_names.get(student_id, f"Student {student_id}")
-                        color = (0, 255, 0)  # Green for recognized
-                        status_text = f"Recognized: {student_name}"
-                        print(f"Face {i}: MATCHED {student_name} with confidence {match_confidence:.4f}")
-                    else:
-                        print(f"Face {i}: NO MATCH found - will show as Unknown Face")
-                        color = (0, 0, 255)  # Red for unknown
-                        status_text = "Unknown Face - Not Registered"
-                else:
-                    print(f"Face {i}: No embedding available - will show as Unknown Face")
-                    color = (0, 0, 255)  # Red for unknown
-                    status_text = "Unknown Face - No Embedding"
+                if track_data and track_data['student_id']:
+                    student_id = track_data['student_id']
+                    confidence = track_data['confidence']
+                    student_name = f"{self.student_names.get(student_id, student_id)} ({confidence:.2f})"
+                    color = (0, 255, 0) # Green for recognized
                 
-                # Draw face bounding box
+                # Draw the bounding box
                 cv2.rectangle(result_frame, (x, y), (x + w, y + h), color, 2)
                 
-                # Draw confidence
-                cv2.putText(result_frame, f"Face: {confidence:.2f}", 
-                           (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                
-                # Draw recognition status
-                cv2.putText(result_frame, status_text, 
-                           (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                
-                # Draw student name if recognized
-                if "Recognized:" in status_text:
-                    cv2.putText(result_frame, f"Student: {student_name}", 
-                               (x, y + h + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
+                # Draw the tracker ID and the student name
+                text = f"ID {object_id}: {student_name}"
+                cv2.putText(result_frame, text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
             return result_frame
-            
+
         except Exception as e:
             print(f"Error drawing enhanced detections: {e}")
             return frame
     
     def _process_recognition_results(self, results: Dict[str, Any]):
-        """Process recognition results and mark attendance"""
+        """Process recognition results using the face tracker and mark attendance."""
         try:
             faces = results.get('faces', [])
             embeddings = results.get('embeddings', [])
             
-            # Debug information
-            if faces:
-                print(f"Processing {len(faces)} faces, {len(embeddings)} embeddings")
-                for i, face in enumerate(faces):
-                    x, y, w, h, conf = face
-                    print(f"  Face {i}: bbox=({x},{y},{w},{h}), confidence={conf:.3f}")
-            else:
-                # No faces detected - removed verbose logging
-                pass
+            rects = [tuple(face[:4]) for face in faces]
             
-            if not faces:
-                return
-            
-            # Process each detected face
-            for i, face in enumerate(faces):
-                x, y, w, h, detection_confidence = face
-                
-                # Skip faces with low detection confidence for recognition processing
-                min_detection_confidence = self.face_confidence_var.get()
-                if detection_confidence < min_detection_confidence:
-                    print(f"Face {i}: Skipping recognition - low detection confidence {detection_confidence:.2f} < {min_detection_confidence:.2f}")
-                    # Still log as unknown face for display purposes
-                    print(f"Face {i}: Will be displayed as Unknown Face (low confidence)")
-                    continue
-                
-                # Get embedding for this face (if available)
-                embedding = None
-                if i < len(embeddings) and embeddings[i] is not None:
-                    embedding = embeddings[i]
-                
-                if embedding is None:
-                    print(f"Face {i}: No embedding available - showing as unknown")
-                    continue
-                
-                print(f"Face {i}: Processing recognition with detection confidence {detection_confidence:.2f}")
-                
-                # Find best match using face embedding similarity
-                best_match = self._find_best_match(embedding)
-                
-                if best_match:
-                    student_id, recognition_confidence = best_match
-                    print(f"Face {i}: Matched student {student_id} with recognition confidence {recognition_confidence:.4f}")
+            tracked_objects = self.face_tracker.update(rects)
+
+            for (object_id, centroid) in tracked_objects.items():
+                if object_id not in self.tracked_face_data or self.tracked_face_data[object_id]['student_id'] is None:
                     
-                    # Update recognized students
-                    student_info = self.database_manager.get_student(student_id)
-                    if student_info:
-                        self.recognized_students[student_id] = (
-                            student_info['name'],
-                            time.time(),
-                            recognition_confidence  # Store recognition confidence, not detection confidence
-                        )
-                        
-                        # Auto-mark attendance if enabled
-                        if self.auto_mark_var.get():
-                            print(f"Auto-marking attendance for {student_id} with recognition confidence {recognition_confidence:.4f}")
-                            self._mark_attendance(student_id, recognition_confidence)
+                    best_face_idx = -1
+                    min_dist = float('inf')
+                    for i, rect in enumerate(rects):
+                        x, y, w, h = rect
+                        face_centroid_x, face_centroid_y = x + w // 2, y + h // 2
+                        dist = np.sqrt((face_centroid_x - centroid[0])**2 + (face_centroid_y - centroid[1])**2)
+                        if dist < min_dist and dist < 50:
+                            min_dist = dist
+                            best_face_idx = i
+
+                    if best_face_idx != -1 and best_face_idx < len(embeddings):
+                        embedding = embeddings[best_face_idx]
+                        if embedding is not None:
+                            print(f"Tracker ID {object_id}: New face detected. Running recognition.")
+                            best_match = self._find_best_match(embedding)
+                            
+                            student_id = None
+                            recognition_confidence = 0.0
+                            
+                            if best_match:
+                                student_id, recognition_confidence = best_match
+                                print(f"Tracker ID {object_id}: Matched student {student_id} with confidence {recognition_confidence:.4f}")
+                                if self.auto_mark_var.get():
+                                    self._mark_attendance(student_id, recognition_confidence)
+                            else:
+                                print(f"Tracker ID {object_id}: No match found.")
+
+                            self.tracked_face_data[object_id] = {
+                                'student_id': student_id,
+                                'confidence': recognition_confidence,
+                                'last_seen': time.time()
+                            }
                         else:
-                            print(f"Auto-mark disabled - would mark {student_id} with recognition confidence {recognition_confidence:.4f}")
+                            self.tracked_face_data[object_id] = {'student_id': None, 'confidence': 0.0, 'last_seen': time.time()}
+                    else:
+                        self.tracked_face_data[object_id] = {'student_id': None, 'confidence': 0.0, 'last_seen': time.time()}
                 else:
-                    print(f"Face {i}: No match found - face will be displayed as UNKNOWN")
-            
-            # Update recognition info display
+                    self.tracked_face_data[object_id]['last_seen'] = time.time()
+
+            current_tracked_ids = set(tracked_objects.keys())
+            all_known_ids = set(self.tracked_face_data.keys())
+            disappeared_ids = all_known_ids - current_tracked_ids
+            for object_id in disappeared_ids:
+                if time.time() - self.tracked_face_data[object_id]['last_seen'] > 2:
+                    print(f"Tracker ID {object_id}: Removing stale track.")
+                    del self.tracked_face_data[object_id]
+
             self._update_recognition_display()
-            
+
         except Exception as e:
             print(f"Error processing recognition results: {e}")
             import traceback
@@ -712,29 +650,9 @@ class AttendanceMarkingDialog:
                 print("Face embedder not initialized")
                 return None
             
-            # Get recognition threshold using threshold tuner
-            ui_threshold = self.threshold_var.get()
-            config_threshold = self.config.get('recognition_confidence', 0.80)
-            
-            # Determine embedder type for threshold selection
-            embedder_type = 'standard_face'  # Default
-            if hasattr(self.face_embedder, '__class__'):
-                if 'InsightFace' in self.face_embedder.__class__.__name__:
-                    embedder_type = 'insightface'
-                elif 'Standard' in self.face_embedder.__class__.__name__:
-                    embedder_type = 'standard_face'
-                elif 'FaceNet' in self.face_embedder.__class__.__name__:
-                    embedder_type = 'facenet'
-                elif 'Simple' in self.face_embedder.__class__.__name__:
-                    embedder_type = 'simple'
-            
-            # Get dynamic threshold for this embedder
-            dynamic_threshold = self.threshold_tuner.get_threshold_for_embedder(embedder_type)
-            
-            # Use the highest threshold for safety
-            recognition_threshold = max(ui_threshold, config_threshold, dynamic_threshold)
-            
-            print(f"Using UI threshold: {ui_threshold:.2f}, config threshold: {config_threshold:.2f}, final threshold: {recognition_threshold:.2f}")
+            # Always use standard_face embedder and threshold 0.6
+            recognition_threshold = 0.6
+            print(f"Using fixed recognition threshold: {recognition_threshold:.2f}")
             print(f"Comparing against {len(self.student_encodings)} students")
             
             best_similarity = 0.0
@@ -800,8 +718,18 @@ class AttendanceMarkingDialog:
             # QUALITY CHECK: Accept matches above threshold, or best match if no one meets threshold
             if best_similarity >= recognition_threshold:
                 
-                # BALANCED LOGIC: Require good confidence with reasonable gap
-                if best_similarity >= recognition_threshold and gap >= min_gap:
+                # SMART GAP LOGIC: Adjust gap requirement based on number of students
+                unique_students = len(set(sid for sid, _, _ in all_similarities))
+                
+                if unique_students == 1:
+                    # Single student scenario: Only require threshold, ignore gap
+                    gap_required = 0.0
+                    print(f"ℹ️  SINGLE STUDENT SCENARIO: Ignoring gap requirement")
+                else:
+                    # Multiple students: Use normal gap requirement
+                    gap_required = min_gap
+                
+                if best_similarity >= recognition_threshold and gap >= gap_required:
                     # Additional consistency check: Compare with last recognition result
                     current_time = time.time()
                     if self.last_recognition_result:
@@ -830,19 +758,22 @@ class AttendanceMarkingDialog:
                     print(f"✓ CLEAR MATCH FOUND: {best_student_id} with similarity {best_similarity:.4f} (gap: {gap:.4f})")
                     return best_student_id, best_similarity
                 else:
-                    print(f"✗ INSUFFICIENT CONFIDENCE: {best_similarity:.4f} < {recognition_threshold:.2f} OR gap {gap:.4f} < {min_gap:.3f}")
+                    print(f"✗ INSUFFICIENT CONFIDENCE: {best_similarity:.4f} < {recognition_threshold:.2f} OR gap {gap:.4f} < {gap_required:.3f}")
                     print(f"✗ REJECTING MATCH - This face will be marked as UNKNOWN")
                     return None
             else:
                 # Fallback: If best match is below threshold but still reasonable, accept it with lower confidence
-                # But only if there's a clear gap between best and second best
-                if best_similarity >= 0.80 and gap >= 0.03:  # Higher fallback threshold with gap requirement
-                    print(f"⚠️  FALLBACK MATCH: Best similarity {best_similarity:.4f} below threshold {recognition_threshold:.2f} but above 0.80 with gap {gap:.3f}")
+                # Adjust gap requirement based on number of students
+                unique_students = len(set(sid for sid, _, _ in all_similarities))
+                fallback_gap_required = 0.03 if unique_students > 1 else 0.0
+                
+                if best_similarity >= 0.35 and gap >= fallback_gap_required:  # Smart gap requirement
+                    print(f"⚠️  FALLBACK MATCH: Best similarity {best_similarity:.4f} below threshold {recognition_threshold:.2f} but above 0.35 with gap {gap:.3f}")
                     print(f"⚠️  ACCEPTING FALLBACK MATCH: {best_student_id} with similarity {best_similarity:.4f}")
                     return best_student_id, best_similarity
                 else:
                     print(f"✗ NO MATCH: Best similarity {best_similarity:.4f} below recognition threshold {recognition_threshold:.2f}")
-                    print(f"✗ NO MATCH: Gap {gap:.3f} insufficient for reliable discrimination")
+                    print(f"✗ NO MATCH: Gap {gap:.3f} insufficient for reliable discrimination (required: {fallback_gap_required:.3f})")
                     print(f"✗ NO MATCH: This face will be marked as UNKNOWN")
                     return None
             
@@ -989,10 +920,10 @@ class AttendanceMarkingDialog:
             if self.is_running:
                 return
             
-            # Initialize pipeline with camera type
+            # Initialize pipeline with camera type and correct embedder
             pipeline_config = self.config.copy()
             pipeline_config['camera_type'] = self.camera_type
-            self.pipeline = DualPipeline(pipeline_config)
+            self.pipeline = DualPipeline(pipeline_config, face_embedder=self.face_embedder)
             self.pipeline.start_pipeline()
             
             self.is_running = True
@@ -1194,3 +1125,64 @@ class AttendanceMarkingDialog:
                 self.face_embedder.release()
         except:
             pass
+    
+    def _process_frame_for_recognition(self, frame: np.ndarray, detected_faces: List[Tuple[int, int, int, int, float]]):
+        """Process a frame for recognition using BlazeFace and InsightFace."""
+        # Debug: Print frame info
+        print(f"[DEBUG] Frame shape: {frame.shape}, dtype: {frame.dtype}")
+        print(f"[DEBUG] Frame sample pixel: {frame[0,0]}")
+        # Ensure frame is RGB and uint8
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame.shape[2] == 3 else frame
+        frame_rgb = frame_rgb.astype(np.uint8)
+        # Get InsightFace results for the full frame
+        insightface_results = self.face_embedder.detect_and_encode_faces(frame_rgb)
+        print(f"[DEBUG] InsightFace detected {len(insightface_results)} faces: {[f[0]['bbox'] for f in insightface_results]}")
+        recognized_students = []
+        for face_box in detected_faces:
+            x, y, w, h, confidence = face_box
+            blaze_bbox = [x, y, x + w, y + h]
+            print(f"[DEBUG] BlazeFace bbox: {blaze_bbox}")
+            def bbox_iou(b1, b2):
+                xA = max(b1[0], b2[0])
+                yA = max(b1[1], b2[1])
+                xB = min(b1[2], b2[2])
+                yB = min(b1[3], b2[3])
+                interArea = max(0, xB - xA) * max(0, yB - yA)
+                boxAArea = (b1[2] - b1[0]) * (b1[3] - b1[1])
+                boxBArea = (b2[2] - b2[0]) * (b2[3] - b2[1])
+                iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+                return iou
+            best_iou = 0.0
+            best_embedding = None
+            for face_info, embedding in insightface_results:
+                if embedding is not None:
+                    iou = bbox_iou(face_info['bbox'], blaze_bbox)
+                    print(f"[DEBUG] IOU between BlazeFace and InsightFace bbox: {iou:.2f}")
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_embedding = embedding
+            if best_embedding is None or best_iou < 0.3:
+                print(f"[ERROR] No matching embedding found for detected face at {blaze_bbox}. Saving frame for inspection.")
+                import uuid
+                fname = f"failed_insightface_{uuid.uuid4().hex}.jpg"
+                cv2.imwrite(fname, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+                print(f"[ERROR] Saved problematic frame to {fname}")
+                recognized_students.append({'student_id': None, 'confidence': 0.0, 'bbox': blaze_bbox})
+                continue
+            print(f"[DEBUG] Selected embedding for bbox {blaze_bbox} with IOU={best_iou:.2f}")
+            best_student_id = None
+            best_similarity = 0.0
+            for student_id, encodings in self.student_encodings.items():
+                for stored_encoding in encodings:
+                    similarity = np.dot(best_embedding, stored_encoding) / (np.linalg.norm(best_embedding) * np.linalg.norm(stored_encoding))
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_student_id = student_id
+            threshold = self.threshold_var.get() if hasattr(self, 'threshold_var') else 0.6
+            if best_similarity >= threshold:
+                print(f"[DEBUG] Recognized student {best_student_id} with similarity {best_similarity:.4f}")
+                recognized_students.append({'student_id': best_student_id, 'confidence': best_similarity, 'bbox': blaze_bbox})
+            else:
+                print(f"[DEBUG] No student matched above threshold for bbox {blaze_bbox}")
+                recognized_students.append({'student_id': None, 'confidence': best_similarity, 'bbox': blaze_bbox})
+        return recognized_students

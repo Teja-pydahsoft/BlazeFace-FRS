@@ -14,6 +14,7 @@ import logging
 from .blazeface_detector import BlazeFaceDetector
 from .human_detector import HumanDetector
 from .standard_face_embedder import StandardFaceEmbedder
+from .simple_face_embedder import SimpleFaceEmbedder
 
 class DualPipeline:
     def __init__(self, 
@@ -42,7 +43,17 @@ class DualPipeline:
         self.human_detector = human_detector or HumanDetector(
             confidence_threshold=config.get('detection_confidence', 0.7)
         )
-        self.face_embedder = face_embedder or StandardFaceEmbedder(model='large')
+        # Initialize face embedder to match database encodings
+        if face_embedder is not None:
+            self.face_embedder = face_embedder
+        else:
+            # Try to use the embedder that matches the database encodings
+            try:
+                self.face_embedder = SimpleFaceEmbedder()  # 256-dimensional embeddings
+                self.logger.info("Using SimpleFaceEmbedder (256-dimensional) for pipeline")
+            except Exception as e:
+                self.logger.warning(f"SimpleFaceEmbedder failed, falling back to StandardFaceEmbedder: {e}")
+                self.face_embedder = StandardFaceEmbedder(model='large')  # 128-dimensional embeddings
         
         # Pipeline state
         self.is_running = False
@@ -199,8 +210,15 @@ class DualPipeline:
             Dictionary containing detection results
         """
         try:
+            # Resize frame for consistent processing, especially for high-res NVR streams
+            nvr_settings = self.config.get('nvr_settings', {})
+            target_width = nvr_settings.get('frame_width', 640)
+            target_height = nvr_settings.get('frame_height', 480)
+            
+            processing_frame = cv2.resize(frame, (target_width, target_height))
+            
             # Detect faces directly
-            faces = self.face_detector.detect_faces(frame)
+            faces = self.face_detector.detect_faces(processing_frame)
             
             # Debug face detection
             if faces:
@@ -215,7 +233,7 @@ class DualPipeline:
             embeddings = []
             for i, face_box in enumerate(faces):
                 x, y, w, h, confidence = face_box
-                face_region = self.face_detector.extract_face_region(frame, (x, y, w, h))
+                face_region = self.face_detector.extract_face_region(processing_frame, (x, y, w, h))
                 if face_region is not None:
                     embedding = self.face_embedder.get_embedding(face_region)
                     if embedding is not None:
@@ -229,7 +247,7 @@ class DualPipeline:
                     embeddings.append(None)
             
             # Detect humans
-            humans = self.human_detector.detect_humans(frame)
+            humans = self.human_detector.detect_humans(processing_frame)
             
             # Update results
             with self.lock:

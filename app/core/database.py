@@ -179,6 +179,12 @@ class DatabaseManager:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 
+                # Check if student already exists
+                cursor.execute("SELECT id FROM students WHERE student_id = ?", (student_data.get('student_id'),))
+                if cursor.fetchone():
+                    self.logger.warning(f"Student already exists: {student_data.get('student_id')}")
+                    return False
+
                 cursor.execute("""
                     INSERT INTO students (student_id, name, email, phone, department, year)
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -250,40 +256,51 @@ class DatabaseManager:
         except Exception as e:
             self.logger.error(f"Error getting all students: {str(e)}")
             return []
-    
-    def add_face_encoding(self, student_id: str, encoding: np.ndarray, 
-                         encoding_type: str = 'facenet', image_path: str = None) -> bool:
+
+    def add_face_encodings(self, student_id: str, encodings: List[np.ndarray], 
+                           encoding_type: str = 'simple', image_paths: List[str] = None) -> bool:
         """
-        Add face encoding for a student
-        
+        Add face encodings for a student. Handles both single and multiple encodings.
+
         Args:
             student_id: Student ID
-            encoding: Face encoding array
-            encoding_type: Type of encoding (default: 'facenet')
-            
+            encodings: A list of face encoding arrays
+            encoding_type: Type of encoding (default: 'simple')
+            image_paths: A list of paths to the face images (optional)
+
         Returns:
             True if successful, False otherwise
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                
-                # Convert numpy array to bytes
-                encoding_bytes = encoding.tobytes()
-                
-                cursor.execute("""
-                    INSERT INTO face_encodings (student_id, encoding, encoding_type, image_path)
-                    VALUES (?, ?, ?, ?)
-                """, (student_id, encoding_bytes, encoding_type, image_path))
+
+                for i, encoding in enumerate(encodings):
+                    encoding_bytes = encoding.tobytes()
+                    image_path = image_paths[i] if image_paths and i < len(image_paths) else None
+                    
+                    cursor.execute("""
+                        INSERT INTO face_encodings (student_id, encoding, encoding_type, image_path)
+                        VALUES (?, ?, ?, ?)
+                    """, (student_id, encoding_bytes, encoding_type, image_path))
                 
                 conn.commit()
-                self.logger.info(f"Face encoding added for student: {student_id}")
+                self.logger.info(f"{len(encodings)} face encoding(s) added for student: {student_id}")
                 return True
                 
         except Exception as e:
-            self.logger.error(f"Error adding face encoding: {str(e)}")
+            self.logger.error(f"Error adding face encodings: {str(e)}")
             return False
-    
+
+    def add_face_encoding(self, student_id: str, encoding: np.ndarray, 
+                         encoding_type: str = 'simple', image_path: str = None) -> bool:
+        """
+        [DEPRECATED] Add a single face encoding for a student. 
+        Use add_face_encodings instead.
+        """
+        self.logger.warning("The 'add_face_encoding' method is deprecated. Use 'add_face_encodings' instead.")
+        return self.add_face_encodings(student_id, [encoding], encoding_type, [image_path])
+
     def get_face_encodings(self, student_id: str = None) -> List[Tuple[str, np.ndarray, str, str]]:
         """
         Get face encodings from the database
@@ -314,13 +331,30 @@ class DatabaseManager:
                 
                 for row in rows:
                     student_id, encoding_bytes, encoding_type, image_path = row
-                    encoding = np.frombuffer(encoding_bytes, dtype=np.float32)
+                    encoding = np.frombuffer(encoding_bytes, dtype=np.float64)
                     encodings.append((student_id, encoding, encoding_type, image_path))
                 
                 return encodings
                 
         except Exception as e:
             self.logger.error(f"Error getting face encodings: {str(e)}")
+            return []
+    
+    def get_encoding_types(self) -> List[str]:
+        """
+        Get all distinct encoding types from the database
+        
+        Returns:
+            List of encoding types used in the database
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT DISTINCT encoding_type FROM face_encodings")
+                rows = cursor.fetchall()
+                return [row[0] for row in rows]
+        except Exception as e:
+            self.logger.error(f"Error getting encoding types: {str(e)}")
             return []
     
     def add_attendance_record(self, student_id: str, status: str = 'present',
