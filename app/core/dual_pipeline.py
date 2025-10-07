@@ -10,11 +10,14 @@ import queue
 import time
 from typing import List, Tuple, Optional, Dict, Any
 import logging
+import os
 
 from .blazeface_detector import BlazeFaceDetector
 from .human_detector import HumanDetector
 from .standard_face_embedder import StandardFaceEmbedder
 from .simple_face_embedder import SimpleFaceEmbedder
+from .insightface_embedder import InsightFaceEmbedder
+from .faiss_index import FaissIndex
 
 class DualPipeline:
     def __init__(self, 
@@ -47,13 +50,18 @@ class DualPipeline:
         if face_embedder is not None:
             self.face_embedder = face_embedder
         else:
-            # Try to use the embedder that matches the database encodings
+            # Prefer InsightFace (buffalo_l) 512-d embeddings as canonical embedder
             try:
-                self.face_embedder = SimpleFaceEmbedder()  # 256-dimensional embeddings
-                self.logger.info("Using SimpleFaceEmbedder (256-dimensional) for pipeline")
+                self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')
+                self.logger.info("Using InsightFaceEmbedder (buffalo_l, 512-d) for pipeline")
             except Exception as e:
-                self.logger.warning(f"SimpleFaceEmbedder failed, falling back to StandardFaceEmbedder: {e}")
-                self.face_embedder = StandardFaceEmbedder(model='large')  # 128-dimensional embeddings
+                self.logger.warning(f"InsightFaceEmbedder init failed, falling back to other embedders: {e}")
+                try:
+                    self.face_embedder = StandardFaceEmbedder(model='large')  # 128-dimensional embeddings
+                    self.logger.info("Using StandardFaceEmbedder (128-d) as fallback")
+                except Exception:
+                    self.face_embedder = SimpleFaceEmbedder()
+                    self.logger.info("Using SimpleFaceEmbedder as final fallback")
         
         # Pipeline state
         self.is_running = False
@@ -74,6 +82,17 @@ class DualPipeline:
         self.current_humans = []
         self.current_embeddings = []
         self.last_update_time = 0
+        # Attempt to load FAISS index if present
+        try:
+            self.faiss_index = FaissIndex()
+            self.faiss_index.load(os.path.join('data', 'faiss'))
+            if self.faiss_index.dim is None:
+                self.faiss_index = None
+            else:
+                self.logger.info('Loaded FAISS index for fast recognition')
+        except Exception as e:
+            self.faiss_index = None
+            self.logger.debug(f'No FAISS index loaded: {e}')
         
         # Synchronization
         self.lock = threading.Lock()

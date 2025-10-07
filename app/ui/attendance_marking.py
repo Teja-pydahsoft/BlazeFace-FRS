@@ -65,11 +65,12 @@ class AttendanceMarkingDialog:
         self.last_recognition_result = None  # (student_id, confidence, timestamp)
         self.recognition_consistency_threshold = 0.05  # 5% variation allowed
         # Per-embedder recognition thresholds (can be overridden via config)
-        # Example: {'insightface': 0.6, 'standard': 0.55, 'simple': 0.5}
+        # Example: use slightly higher threshold for 512-d InsightFace
         self.recognition_thresholds = config.get('recognition_thresholds', {
-            'insightface': 0.6,
+            'insightface': 0.62,
             'standard': 0.55,
-            'simple': 0.5
+            'simple': 0.5,
+            'faiss': 0.60
         })
         
         # Create dialog window
@@ -293,12 +294,12 @@ class AttendanceMarkingDialog:
                     print("StandardFaceEmbedder selected to match DB (128-dim)")
                     return
                 except Exception as e:
-                    print(f"StandardFaceEmbedder init failed, falling back to InsightFace: {e}")
+                    print(f"StandardFaceEmbedder init failed, will try InsightFace next: {e}")
 
-            # Default: use InsightFace
+            # Prefer InsightFace (512-d) as canonical runtime embedder
             try:
                 self.face_embedder = InsightFaceEmbedder(model_name='buffalo_l')
-                print("InsightFaceEmbedder (ArcFace) initialized for recognition and matching")
+                print("InsightFaceEmbedder (buffalo_l, 512-d) initialized for recognition and matching")
             except Exception as e:
                 print(f"InsightFaceEmbedder failed: {e}")
                 self.face_embedder = None
@@ -727,56 +728,98 @@ class AttendanceMarkingDialog:
             if self.face_embedder is None:
                 print("Face embedder not initialized")
                 return None
-            
-            # We'll compute similarity across stored encodings and pick best match.
-            # Recognition acceptance uses the encoding_type of the best-matching stored encoding and
-            # applies per-embedder threshold from `self.recognition_thresholds`.
-            print(f"Comparing against {len(self.student_encodings)} students")
-            
+            # Fast-path: if a FAISS index is loaded in the pipeline and the query dim matches, use it
+            all_similarities = []  # list of (student_id, enc_idx, sim, encoding_type)
             best_similarity = 0.0
             best_student_id = None
             best_encoding_type = None
-            all_similarities = []  # Track all similarities for debugging (student_id, enc_idx, sim, encoding_type)
-            
-            for student_id, enc_list in self.student_encodings.items():
-                print(f"Checking student {student_id} with {len(enc_list)} encodings")
-                student_max_similarity = 0.0
-                
-                for i, enc_obj in enumerate(enc_list):
-                    encoding = enc_obj.get('encoding')
-                    enc_type = enc_obj.get('encoding_type', 'insightface')
 
-                    # Skip if encoding dims don't match query
-                    try:
-                        if encoding is None or encoding.ndim != 1 or encoding.shape[0] != query_embedding.shape[0]:
-                            print(f"  Skipping encoding {i} for student {student_id}: shape mismatch (stored={None if encoding is None else encoding.shape}, query={query_embedding.shape})")
+            faiss_index = None
+            try:
+                if hasattr(self, 'pipeline') and getattr(self.pipeline, 'faiss_index', None) is not None:
+                    faiss_index = self.pipeline.faiss_index
+            except Exception:
+                faiss_index = None
+
+            if faiss_index is not None and faiss_index.dim is not None:
+                try:
+                    q = np.asarray(query_embedding, dtype=np.float32)
+                    if q.ndim == 1:
+                        q = q.reshape(1, -1)
+                    if q.shape[1] == faiss_index.dim:
+                        # Search top-k from FAISS
+                        k = min(5, len(faiss_index.names) if faiss_index.names is not None else 5)
+                        D, I, N = faiss_index.search(q, k=k)
+                        # D: similarities, N: names list
+                        sims = D[0].tolist()
+                        names = N[0]
+                        # Aggregate per-student max similarity
+                        per_student = {}
+                        for idx, (sim, name) in enumerate(zip(sims, names)):
+                            if name is None:
+                                continue
+                            sid = str(name)
+                            # We don't have enc_idx from FAISS; use -1 as placeholder
+                            all_similarities.append((sid, -1, float(sim), 'faiss'))
+                            if sid not in per_student or per_student[sid] < sim:
+                                per_student[sid] = float(sim)
+
+                        # Find best and second best
+                        sorted_per = sorted(per_student.items(), key=lambda x: x[1], reverse=True)
+                        if sorted_per:
+                            best_student_id, best_similarity = sorted_per[0]
+                            best_encoding_type = 'faiss'
+                        # For debug, print top few
+                        print(f"FAISS fast-path returned top {len(sorted_per)} candidates")
+                    else:
+                        print(f"FAISS skip: dimension mismatch (index={faiss_index.dim}, query={q.shape[1]})")
+                        faiss_index = None
+                except Exception as e:
+                    print(f"FAISS search failed: {e}")
+                    faiss_index = None
+
+            # If FAISS didn't produce results, fall back to the brute-force matching below
+            if faiss_index is None:
+                print(f"Comparing against {len(self.student_encodings)} students (brute-force)")
+                for student_id, enc_list in self.student_encodings.items():
+                    print(f"Checking student {student_id} with {len(enc_list)} encodings")
+                    student_max_similarity = 0.0
+
+                    for i, enc_obj in enumerate(enc_list):
+                        encoding = enc_obj.get('encoding')
+                        enc_type = enc_obj.get('encoding_type', 'insightface')
+
+                        # Skip if encoding dims don't match query
+                        try:
+                            if encoding is None or encoding.ndim != 1 or encoding.shape[0] != query_embedding.shape[0]:
+                                print(f"  Skipping encoding {i} for student {student_id}: shape mismatch (stored={None if encoding is None else encoding.shape}, query={query_embedding.shape})")
+                                continue
+                        except Exception:
                             continue
-                    except Exception:
-                        continue
 
-                    # Use compare_faces to get similarity (we pass very low threshold to obtain the raw score)
-                    is_same, similarity = self.face_embedder.compare_faces(query_embedding, encoding, 0.01)
-                    all_similarities.append((student_id, i, similarity, enc_type))
-                    # Track the highest similarity for this student
-                    if similarity > student_max_similarity:
-                        student_max_similarity = similarity
-                    print(f"  Encoding {i} (type={enc_type}): similarity={similarity:.4f}")
-                
-                print(f"  Student {student_id} max similarity: {student_max_similarity:.4f}")
-                
-                # Track the best match regardless of threshold (threshold check happens later)
-                if student_max_similarity > best_similarity:
-                    best_similarity = student_max_similarity
-                    best_student_id = student_id
-                    # find which encoding produced the student_max_similarity to know its encoding_type
-                    # search all_similarities for that student
-                    best_enc_type = None
-                    for sid, enc_idx, sim, enc_type in all_similarities:
-                        if sid == student_id and abs(sim - student_max_similarity) < 1e-6:
-                            best_enc_type = enc_type
-                            break
-                    best_encoding_type = best_enc_type or 'insightface'
-                    print(f"  -> New best match: {student_id} with similarity {student_max_similarity:.4f} (encoding_type={best_encoding_type})")
+                        # Use compare_faces to get similarity (we pass very low threshold to obtain the raw score)
+                        is_same, similarity = self.face_embedder.compare_faces(query_embedding, encoding, 0.01)
+                        all_similarities.append((student_id, i, similarity, enc_type))
+                        # Track the highest similarity for this student
+                        if similarity > student_max_similarity:
+                            student_max_similarity = similarity
+                        print(f"  Encoding {i} (type={enc_type}): similarity={similarity:.4f}")
+
+                    print(f"  Student {student_id} max similarity: {student_max_similarity:.4f}")
+
+                    # Track the best match regardless of threshold (threshold check happens later)
+                    if student_max_similarity > best_similarity:
+                        best_similarity = student_max_similarity
+                        best_student_id = student_id
+                        # find which encoding produced the student_max_similarity to know its encoding_type
+                        # search all_similarities for that student
+                        best_enc_type = None
+                        for sid, enc_idx, sim, enc_type in all_similarities:
+                            if sid == student_id and abs(sim - student_max_similarity) < 1e-6:
+                                best_enc_type = enc_type
+                                break
+                        best_encoding_type = best_enc_type or 'insightface'
+                        print(f"  -> New best match: {student_id} with similarity {student_max_similarity:.4f} (encoding_type={best_encoding_type})")
             
             # Debug: Show all similarities
             print("All similarities:")

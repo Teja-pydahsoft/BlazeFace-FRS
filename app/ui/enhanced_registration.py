@@ -22,6 +22,7 @@ from ..core.blazeface_detector import BlazeFaceDetector
 from ..core.database import DatabaseManager
 from ..utils.camera_utils import CameraManager
 from ..utils.encoding_quality_checker import EncodingQualityChecker
+from ..core.faiss_index import FaissIndex
 
 class EnhancedRegistrationDialog:
     def __init__(self, parent, database_manager: DatabaseManager, config: Dict[str, Any], 
@@ -50,7 +51,8 @@ class EnhancedRegistrationDialog:
             'standard': StandardFaceEmbedder(),
             'insightface': InsightFaceEmbedder()
         }
-        self.current_embedder = 'standard'  # Default to best embedder
+        # Default to InsightFace (512-d) for registration to build canonical gallery
+        self.current_embedder = 'insightface'
         
         # Use existing camera manager or create new one
         if existing_camera_manager and existing_camera_manager.is_camera_available():
@@ -876,6 +878,19 @@ class EnhancedRegistrationDialog:
                 )
                 if success:
                     success_count += 1
+                    # Add to FAISS index if available
+                    try:
+                        fi = FaissIndex()
+                        base = os.path.join('data', 'faiss')
+                        if os.path.exists(base + '.pkl') or os.path.exists(base + '.index'):
+                            fi.load(base)
+                        # add this embedding
+                        emb = face_data['embedding'].astype('float32')
+                        fi.add(emb.reshape(1, -1), [student_data['student_id']])
+                        fi.save(base)
+                    except Exception as e:
+                        # Non-fatal: log and continue
+                        logging.getLogger(__name__).warning(f"FAISS update failed for {student_data['student_id']}: {e}")
             
             if success_count > 0:
                 messagebox.showinfo("Success", 
