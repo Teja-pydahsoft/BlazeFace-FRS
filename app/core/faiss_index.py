@@ -58,7 +58,8 @@ class FaissIndex:
             self.index.add(embeddings)
         elif _HAS_HNSW:
             self.index = hnswlib.Index(space='cosine', dim=self.dim)
-            self.index.init_index(max_elements=len(embeddings), ef_construction=200, M=16)
+            # Initialize with a reasonable initial size, will grow dynamically
+            self.index.init_index(max_elements=max(1000, len(embeddings)), ef_construction=200, M=16)
             self.index.add_items(embeddings, np.arange(len(embeddings)))
             self.index.set_ef(50)
         else:
@@ -80,9 +81,15 @@ class FaissIndex:
         if _HAS_FAISS:
             self.index.add(new_embeddings)
         elif _HAS_HNSW:
+            # Dynamically resize HNSW index if needed
+            if self.index.get_max_elements() < len(self.names) + len(new_embeddings):
+                new_max_elements = max(self.index.get_max_elements() * 2, len(self.names) + len(new_embeddings) + 1000)
+                self.index.resize_index(new_max_elements)
             start_id = len(self.names)
             self.index.add_items(new_embeddings, np.arange(start_id, start_id + len(new_embeddings)))
         else:
+            if self.embeddings is not None and new_embeddings.shape[1] != self.embeddings.shape[1]:
+                raise ValueError("Dimension mismatch for numpy fallback")
             self.embeddings = np.vstack([self.embeddings, new_embeddings]) if self.embeddings is not None else new_embeddings
         self.names.extend(list(new_names))
 

@@ -42,8 +42,9 @@ class InsightFaceEmbedder:
             self.logger.info(f"InsightFace embedder initialized with {model_name} model")
         except Exception as e:
             self.logger.error(f"Failed to initialize InsightFace: {e}")
-            raise RuntimeError(f"InsightFace not available: {e}")
-    
+            self.app = None # Set app to None on failure
+            # Do not re-raise here, allow graceful degradation or external handling
+
     def preprocess_face(self, face_image: np.ndarray) -> np.ndarray:
         """
         Preprocess face image for InsightFace
@@ -101,6 +102,9 @@ class InsightFaceEmbedder:
         Returns:
             Face embedding vector (512-dimensional) or None if failed
         """
+        if self.app is None:
+            self.logger.error("InsightFace app not initialized. Cannot get embedding.")
+            return None
         try:
             # Preprocess face
             processed_face = self.preprocess_face(face_image)
@@ -215,7 +219,7 @@ class InsightFaceEmbedder:
             self.logger.error(f"Error finding best match: {str(e)}")
             return None, 0.0
     
-    def detect_and_encode_faces(self, image: np.ndarray) -> List[Tuple[dict, np.ndarray]]:
+    def detect_and_encode_faces(self, image: np.ndarray) -> List[Tuple[int, int, int, int, float, np.ndarray]]:
         """
         Detect faces in image and return their encodings with metadata
         
@@ -225,6 +229,9 @@ class InsightFaceEmbedder:
         Returns:
             List of tuples (face_info, face_encoding)
         """
+        if self.app is None:
+            self.logger.error("InsightFace app not initialized. Cannot detect and encode faces.")
+            return []
         try:
             # Preprocess image once (convert ordering/dtype/resize heuristics) before analysis
             proc = self.preprocess_face(image)

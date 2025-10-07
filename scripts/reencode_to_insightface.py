@@ -88,17 +88,89 @@ def main():
                 continue
             # InsightFace expects RGB
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = embedder.detect_and_encode_faces(img_rgb)
-            if not results:
-                # try whole-image embedding
-                emb = embedder.get_embedding(img_rgb)
-                if emb is None:
-                    failed.append((rid, sid, 'no_embedding'))
-                    continue
-                embedding = np.asarray(emb, dtype=np.float32)
+
+            # Try a sequence of heuristics/augmentations to coax out a face detection
+            candidate_embeddings = []
+
+            def try_image(im_rgb):
+                try:
+                    res = embedder.detect_and_encode_faces(im_rgb)
+                    if res:
+                        return np.asarray(res[0][1], dtype=np.float32)
+                    emb = embedder.get_embedding(im_rgb)
+                    if emb is not None:
+                        return np.asarray(emb, dtype=np.float32)
+                except Exception:
+                    return None
+                return None
+
+            # 1) original
+            e = try_image(img_rgb)
+            if e is not None:
+                embedding = e
             else:
-                # pick the first embedding
-                embedding = np.asarray(results[0][1], dtype=np.float32)
+                # 2) scaled versions
+                h, w = img_rgb.shape[:2]
+                for scale in (1.5, 2.0, 3.0):
+                    nh, nw = int(h * scale), int(w * scale)
+                    resized = cv2.resize(img_rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+                    e = try_image(resized)
+                    if e is not None:
+                        embedding = e
+                        break
+
+            if 'embedding' not in locals():
+                # 3) center crop scaled
+                h, w = img_rgb.shape[:2]
+                cx, cy = w // 2, h // 2
+                s = max(1, min(w, h) // 2)
+                crop = img_rgb[max(0, cy - s):min(h, cy + s), max(0, cx - s):min(w, cx + s)]
+                if crop.size > 0:
+                    for scale in (1.0, 2.0):
+                        nh, nw = int(crop.shape[0] * scale), int(crop.shape[1] * scale)
+                        resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_LINEAR)
+                        e = try_image(resized)
+                        if e is not None:
+                            embedding = e
+                            break
+
+            if 'embedding' not in locals():
+                # 4) histogram equalization on each channel and try flips/rotations
+                try:
+                    yc = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2YCrCb)
+                    y, cr, cb = cv2.split(yc)
+                    y_eq = cv2.equalizeHist(y)
+                    yc_eq = cv2.merge((y_eq, cr, cb))
+                    img_eq = cv2.cvtColor(yc_eq, cv2.COLOR_YCrCb2RGB)
+                    e = try_image(img_eq)
+                    if e is not None:
+                        embedding = e
+                except Exception:
+                    pass
+
+            if 'embedding' not in locals():
+                # try flips and small rotations
+                for flipped in (False, True):
+                    if flipped:
+                        timg = cv2.flip(img_rgb, 1)
+                    else:
+                        timg = img_rgb
+                    for angle in (0, 15, -15, 30, -30):
+                        if angle != 0:
+                            M = cv2.getRotationMatrix2D((timg.shape[1] / 2, timg.shape[0] / 2), angle, 1)
+                            rotated = cv2.warpAffine(timg, M, (timg.shape[1], timg.shape[0]))
+                        else:
+                            rotated = timg
+                        e = try_image(rotated)
+                        if e is not None:
+                            embedding = e
+                            break
+                    if 'embedding' in locals():
+                        break
+
+            if 'embedding' not in locals():
+                failed.append((rid, sid, 'no_embedding'))
+                continue
 
             # Add to DB using DatabaseManager API
             ok = db.add_face_encoding(sid, embedding, encoding_type='insightface', image_path=img_path)

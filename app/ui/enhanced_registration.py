@@ -53,6 +53,7 @@ class EnhancedRegistrationDialog:
         }
         # Default to InsightFace (512-d) for registration to build canonical gallery
         self.current_embedder = 'insightface'
+        self.embedder_var = tk.StringVar(value="insightface") # Set default to insightface
         
         # Use existing camera manager or create new one
         if existing_camera_manager and existing_camera_manager.is_camera_available():
@@ -389,20 +390,73 @@ class EnhancedRegistrationDialog:
                 if not ret:
                     continue
                 
-                # Detect faces
-                faces = self.face_detector.detect_faces(frame)
+                # Get frame dimensions
+                h, w = frame.shape[:2]
+                frame_area = h * w
                 
-                # Draw face detection
+                # Convert to RGB for InsightFace
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Use InsightFace's detector for consistent detection
                 display_frame = frame.copy()
                 face_detected = False
+                guidance_text = "Position your face in the camera"
+                guidance_color = (255, 255, 255)  # White
                 
-                for face in faces:
-                    x, y, w, h, confidence = face
-                    if confidence > 0.7:  # Good confidence threshold
-                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        cv2.putText(display_frame, f"Face: {confidence:.2f}", 
-                                   (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        face_detected = True
+                try:
+                    if self.embedders['insightface'].app is not None:
+                        faces = self.embedders['insightface'].app.get(rgb_frame)
+                        if faces:
+                            for face in faces:
+                                bbox = face.bbox.astype(int)
+                                x1, y1, x2, y2 = bbox
+                                w, h = x2 - x1, y2 - y1
+                                face_area = w * h
+                                area_ratio = face_area / frame_area
+                                
+                                # Draw face rectangle
+                                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                
+                                # Provide specific guidance based on face size and position
+                                if area_ratio < 0.05:  # Face too small
+                                    guidance_text = "Move closer to the camera"
+                                    guidance_color = (255, 165, 0)  # Orange
+                                elif area_ratio > 0.4:  # Face too large
+                                    guidance_text = "Move back from the camera"
+                                    guidance_color = (255, 165, 0)  # Orange
+                                elif x1 < 50 or y1 < 50 or x2 > w-50 or y2 > h-50:
+                                    guidance_text = "Center your face in the frame"
+                                    guidance_color = (255, 165, 0)  # Orange
+                                else:
+                                    guidance_text = "Perfect! Ready to capture"
+                                    guidance_color = (0, 255, 0)  # Green
+                                    face_detected = True
+                                
+                                # Display confidence
+                                conf_text = f"Quality: {face.det_score:.2f}"
+                                cv2.putText(display_frame, conf_text, 
+                                          (x1, y1 - 25), cv2.FONT_HERSHEY_SIMPLEX, 
+                                          0.7, (0, 255, 0), 2)
+                        else:
+                            guidance_text = "No face detected - Look directly at camera"
+                            guidance_color = (0, 0, 255)  # Red
+                except Exception as e:
+                    # Fallback to basic detection if InsightFace fails
+                    faces = self.face_detector.detect_faces(frame)
+                    for face in faces:
+                        x, y, w, h, confidence = face
+                        if confidence > 0.7:
+                            cv2.rectangle(display_frame, (x, y), (x + w, y + h), 
+                                        (0, 255, 0), 2)
+                            cv2.putText(display_frame, f"Face: {confidence:.2f}", 
+                                      (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 
+                                      0.7, (0, 255, 0), 2)
+                            face_detected = True
+                
+                # Add guidance text at the top of the frame
+                cv2.putText(display_frame, guidance_text, 
+                          (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                          0.8, guidance_color, 2)
                 
                 # Convert to PhotoImage and update display
                 display_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
@@ -412,7 +466,7 @@ class EnhancedRegistrationDialog:
                 photo = ImageTk.PhotoImage(image)
                 
                 # Update UI in main thread
-                self.dialog.after(0, self._update_camera_display, photo, face_detected)
+                self.dialog.after(0, self._update_camera_display, photo, face_detected, guidance_text, self._bgr_to_hex(guidance_color))
                 
                 time.sleep(0.033)  # ~30 FPS
                 
@@ -420,7 +474,13 @@ class EnhancedRegistrationDialog:
             print(f"Camera loop error: {e}")
             self.dialog.after(0, lambda: self.status_label.config(text="Camera error", foreground='red'))
     
-    def _update_camera_display(self, photo, face_detected):
+    def _bgr_to_hex(self, color_bgr: Tuple[int, int, int]) -> str:
+        """Converts a BGR color tuple to a Tkinter-compatible hex string."""
+        # OpenCV uses BGR, Tkinter uses RGB hex. The guidance color is created as RGB, so we just format it.
+        r, g, b = color_bgr
+        return f'#{r:02x}{g:02x}{b:02x}'
+
+    def _update_camera_display(self, photo, face_detected, guidance_text, guidance_color_hex):
         """Update camera display in main thread"""
         try:
             # Check if dialog still exists
@@ -431,11 +491,8 @@ class EnhancedRegistrationDialog:
             self.display_canvas.create_image(250, 200, image=photo, anchor=tk.CENTER)
             self.display_canvas.image = photo  # Keep a reference
             
-            # Update status
-            if face_detected:
-                self.status_label.config(text="Status: Face detected - Ready to capture", foreground='green')
-            else:
-                self.status_label.config(text="Status: Position your face in the camera", foreground='blue')
+            # Update status label with detailed guidance
+            self.status_label.config(text=f"Status: {guidance_text}", foreground=guidance_color_hex)
                 
         except tk.TclError:
             # Dialog was closed, stop camera loop
@@ -443,6 +500,14 @@ class EnhancedRegistrationDialog:
         except Exception as e:
             print(f"Error updating camera display: {e}")
     
+    def _is_image_bright_and_clear(self, img: np.ndarray) -> bool:
+        """Check if the image is well-lit and not over/underexposed."""
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.shape[2] == 3 else img
+        mean = np.mean(gray)
+        std = np.std(gray)
+        # Acceptable brightness: mean between 60 and 200, std above 30
+        return 60 < mean < 200 and std > 30
+
     def _capture_face(self):
         """Capture face from current camera frame"""
         try:
@@ -455,480 +520,337 @@ class EnhancedRegistrationDialog:
                 messagebox.showwarning("Warning", "No camera feed available")
                 return
             
-            # Detect faces
-            faces = self.face_detector.detect_faces(frame)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_area = rgb_frame.shape[0] * rgb_frame.shape[1]
             
-            if not faces:
-                messagebox.showwarning("Warning", "No face detected in current frame")
-                return
-            
-            # Use the best face (highest confidence)
-            best_face = max(faces, key=lambda f: f[4])
-            x, y, w, h, confidence = best_face
-            
-            if confidence < 0.7:
-                messagebox.showwarning("Warning", f"Face detection confidence too low: {confidence:.2f}")
-                return
-            
-            # Extract face region
-            face_region = self.face_detector.extract_face_region(frame, (x, y, w, h))
-            
-            if face_region is not None and face_region.size > 0:
-                # Get face embedding
-                embedder = self.embedders[self.current_embedder]
-                embedding = embedder.get_embedding(face_region)
-                
-                if embedding is not None:
-                    # Check encoding quality
-                    student_id = self.student_id_var.get().strip()
-                    
-                    # Get existing encodings for quality check
-                    existing_encodings = []
-                    other_encodings = []
-                    if student_id:
-                        existing_encs = self.database_manager.get_face_encodings(student_id)
-                        existing_encodings = [enc for _, enc, _, _ in existing_encs]
-                    
-                    all_encs = self.database_manager.get_face_encodings()
-                    for sid, enc, _, _ in all_encs:
-                        if sid != student_id:
-                            other_encodings.append(enc)
-                    
-                    # Check quality
-                    is_acceptable, reason, quality_metrics = self.quality_checker.check_new_encoding_quality(
-                        embedding, existing_encodings, other_encodings, student_id
-                    )
-                    
-                    quality_threshold = self.quality_var.get()
-                    if quality_metrics.get('quality_score', 0) < quality_threshold:
-                        is_acceptable = False
-                        reason = f"Quality score {quality_metrics.get('quality_score', 0):.2f} below threshold {quality_threshold:.2f}"
-                    
-                    if not is_acceptable:
-                        messagebox.showwarning("Quality Check Failed", 
-                            f"Face encoding quality check failed:\n\n{reason}\n\n"
-                            f"Please try again with:\n"
-                            f"- Better lighting\n"
-                            f"- Clearer face positioning\n"
-                            f"- Different angle")
+            if self.current_embedder == 'insightface':
+                try:
+                    embedder = self.embedders['insightface']
+                    if embedder.app is None:
+                        messagebox.showerror("Error", "InsightFace embedder not initialized properly")
                         return
-                    
-                    # Store captured face
-                    face_data = {
-                        'image': face_region,
-                        'embedding': embedding,
-                        'confidence': confidence,
-                        'timestamp': time.time(),
-                        'quality_metrics': quality_metrics,
-                        'source': 'camera',
-                        'image_path': None
-                    }
-                    self.captured_faces.append(face_data)
-                    
-                    # Update display
-                    self._update_captured_faces_display()
-                    
-                    quality_score = quality_metrics.get('quality_score', 0.0)
-                    messagebox.showinfo("Success", 
-                        f"Face captured successfully!\n"
-                        f"Confidence: {confidence:.2f}\n"
-                        f"Quality Score: {quality_score:.2f}\n"
-                        f"Encoder: {self.current_embedder}")
-                else:
-                    messagebox.showerror("Error", "Failed to generate face embedding")
+                    faces = embedder.app.get(rgb_frame)
+                    if not faces:
+                        messagebox.showwarning("Warning", 
+                            "No face detected. Please ensure:\n" +
+                            "1. You are looking directly at the camera\n" +
+                            "2. Your face is well-lit\n" +
+                            "3. You are at a good distance (not too close/far)")
+                        return
+                    best_face = max(faces, key=lambda f: f.det_score)
+                    bbox = best_face.bbox.astype(int)
+                    x1, y1, x2, y2 = bbox
+                    w, h = x2 - x1, y2 - y1
+                    face_area = w * h
+                    area_ratio = face_area / frame_area
+                    # Area ratio check: face should be 10%-40% of frame
+                    if area_ratio < 0.10:
+                        messagebox.showwarning("Warning", "Face too small. Move closer to the camera.")
+                        return
+                    if area_ratio > 0.40:
+                        messagebox.showwarning("Warning", "Face too large. Move back from the camera.")
+                        return
+                    # Centering check
+                    margin = 40
+                    if x1 < margin or y1 < margin or x2 > rgb_frame.shape[1] - margin or y2 > rgb_frame.shape[0] - margin:
+                        messagebox.showwarning("Warning", "Center your face in the frame.")
+                        return
+                    # Brightness/contrast check
+                    face_crop = rgb_frame[y1:y2, x1:x2]
+                    if not self._is_image_bright_and_clear(face_crop):
+                        messagebox.showwarning("Warning", "Face region is too dark, too bright, or blurry. Adjust lighting and try again.")
+                        return
+                    face_region = rgb_frame
+                except Exception as e:
+                    messagebox.showerror("Error", f"InsightFace detection failed: {str(e)}")
+                    return
             else:
-                messagebox.showerror("Error", "Failed to extract face region")
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to capture face: {str(e)}")
-    
-    def _select_images(self):
-        """Select high-quality images for face processing"""
-        try:
-            filetypes = [
-                ("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff"),
-                ("JPEG files", "*.jpg *.jpeg"),
-                ("PNG files", "*.png"),
-                ("All files", "*.*")
-            ]
+                faces = self.face_detector.detect_faces(frame)
+                if not faces:
+                    messagebox.showwarning("Warning", "No face detected in current frame")
+                    return
+                best_face = max(faces, key=lambda f: f[4])
+                x, y, w, h, confidence = best_face
+                face_area = w * h
+                area_ratio = face_area / frame_area
+                if area_ratio < 0.10:
+                    messagebox.showwarning("Warning", "Face too small. Move closer to the camera.")
+                    return
+                if area_ratio > 0.40:
+                    messagebox.showwarning("Warning", "Face too large. Move back from the camera.")
+                    return
+                margin = 40
+                if x < margin or y < margin or x + w > frame.shape[1] - margin or y + h > frame.shape[0] - margin:
+                    messagebox.showwarning("Warning", "Center your face in the frame.")
+                    return
+                face_region = self.face_detector.extract_face_region(frame, (x, y, w, h))
+                if face_region is not None and face_region.size > 0:
+                    if not self._is_image_bright_and_clear(face_region):
+                        messagebox.showwarning("Warning", "Face region is too dark, too bright, or blurry. Adjust lighting and try again.")
+                        return
             
-            filenames = filedialog.askopenfilenames(
-                title="Select High-Quality Student Photos",
-                filetypes=filetypes
+            # Get face embedding
+            embedder = self.embedders[self.current_embedder]
+            
+            # If current embedder is InsightFace, try with a slightly larger region if initial detection fails
+            if self.current_embedder == 'insightface':
+                embedding = embedder.get_embedding(face_region)
+                if embedding is None:
+                    # Try expanding the face region slightly and re-embedding
+                    expanded_x = max(0, x - int(w * 0.1))
+                    expanded_y = max(0, y - int(h * 0.1))
+                    expanded_w = min(frame.shape[1] - expanded_x, int(w * 1.2))
+                    expanded_h = min(frame.shape[0] - expanded_y, int(h * 1.2))
+                    expanded_face_region = self.face_detector.extract_face_region(frame, (expanded_x, expanded_y, expanded_w, expanded_h))
+                    if expanded_face_region is not None and expanded_face_region.size > 0:
+                        embedding = embedder.get_embedding(expanded_face_region)
+            else:
+                embedding = embedder.get_embedding(face_region)
+
+            if embedding is None:
+                messagebox.showwarning("Warning", f"Failed to get embedding with {self.current_embedder} embedder. Please ensure your face is clear and well-lit.")
+                return
+            
+            # Check encoding quality
+            student_id = self.student_id_var.get().strip()
+            
+            # Get existing encodings for quality check
+            existing_encodings = []
+            other_encodings = []
+            if student_id:
+                existing_encs = self.database_manager.get_face_encodings(student_id)
+                existing_encodings = [enc for _, enc, _, _ in existing_encs]
+            
+            all_encs = self.database_manager.get_face_encodings()
+            for sid, enc, _, _ in all_encs:
+                if sid != student_id:
+                    other_encodings.append(enc)
+            
+            # Check quality
+            is_acceptable, reason, quality_metrics = self.quality_checker.check_new_encoding_quality(
+                embedding, existing_encodings, other_encodings, student_id
             )
             
-            if filenames:
-                self.uploaded_images = list(filenames)
-                self._update_image_list()
-                self.process_btn.config(state=tk.NORMAL)
-                self.status_label.config(text=f"Status: {len(filenames)} images selected", foreground='green')
-                
+            # Add to captured faces list
+            if is_acceptable:
+                self.captured_faces.append({
+                    "image": face_region,
+                    "embedding": embedding,
+                    "quality": quality_metrics,
+                    "embedder": self.current_embedder
+                })
+                self._update_captured_faces_display()
+            else:
+                messagebox.showwarning("Quality Warning", 
+                                     f"Face not added due to low quality: {reason}\n"
+                                     f"Details: {quality_metrics}")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to select images: {str(e)}")
-    
-    def _update_image_list(self):
-        """Update the image listbox"""
-        try:
-            self.image_listbox.delete(0, tk.END)
-            for i, image_path in enumerate(self.uploaded_images):
-                filename = os.path.basename(image_path)
-                self.image_listbox.insert(tk.END, f"{i+1}. {filename}")
-        except Exception as e:
-            print(f"Error updating image list: {e}")
-    
-    def _preview_selected_image(self, event=None):
-        """Preview selected image"""
-        try:
-            selection = self.image_listbox.curselection()
-            if not selection:
-                return
-            
-            index = selection[0]
-            if 0 <= index < len(self.uploaded_images):
-                image_path = self.uploaded_images[index]
-                
-                # Load and display image
-                image = cv2.imread(image_path)
-                if image is not None:
-                    # Resize to fit display
-                    height, width = image.shape[:2]
-                    scale = min(500 / width, 400 / height)
-                    new_width = int(width * scale)
-                    new_height = int(height * scale)
-                    
-                    resized = cv2.resize(image, (new_width, new_height))
-                    rgb_image = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                    
-                    # Convert to PhotoImage
-                    pil_image = Image.fromarray(rgb_image)
-                    photo = ImageTk.PhotoImage(pil_image)
-                    
-                    # Update display
-                    self.display_canvas.delete('all')
-                    self.display_canvas.create_image(250, 200, image=photo, anchor=tk.CENTER)
-                    self.display_canvas.image = photo
-                    
-                    self.status_label.config(text=f"Preview: {os.path.basename(image_path)}", foreground='blue')
-                    
-        except Exception as e:
-            print(f"Error previewing image: {e}")
-    
-    def _process_uploaded_images(self):
-        """Process uploaded images to extract faces"""
-        try:
-            if not self.uploaded_images:
-                messagebox.showwarning("Warning", "No images selected")
-                return
-            
-            embedder = self.embedders[self.current_embedder]
-            processed_count = 0
-            failed_count = 0
-            
-            for image_path in self.uploaded_images:
-                try:
-                    # Load image
-                    image = cv2.imread(image_path)
-                    if image is None:
-                        failed_count += 1
-                        continue
-                    
-                    # Detect faces
-                    faces = self.face_detector.detect_faces(image)
-                    
-                    if not faces:
-                        failed_count += 1
-                        continue
-                    
-                    # Use the best face (largest area)
-                    best_face = max(faces, key=lambda f: f[2] * f[3])  # w * h
-                    x, y, w, h, confidence = best_face
-                    
-                    # Extract face region
-                    face_region = self.face_detector.extract_face_region(image, (x, y, w, h))
-                    
-                    if face_region is not None and face_region.size > 0:
-                        # Get face embedding
-                        embedding = embedder.get_embedding(face_region)
-                        
-                        if embedding is not None:
-                            # Check quality
-                            quality_threshold = self.quality_var.get()
-                            
-                            # Simple quality check for images
-                            quality_score = self._calculate_image_quality(face_region)
-                            
-                            if quality_score >= quality_threshold:
-                                # Store captured face
-                                face_data = {
-                                    'image': face_region,
-                                    'embedding': embedding,
-                                    'confidence': confidence,
-                                    'timestamp': time.time(),
-                                    'quality_metrics': {'quality_score': quality_score},
-                                    'source': 'image',
-                                    'image_path': image_path
-                                }
-                                self.captured_faces.append(face_data)
-                                processed_count += 1
-                            else:
-                                failed_count += 1
-                        else:
-                            failed_count += 1
-                    else:
-                        failed_count += 1
-                        
-                except Exception as e:
-                    print(f"Error processing image {image_path}: {e}")
-                    failed_count += 1
-            
-            # Update display
-            self._update_captured_faces_display()
-            
-            messagebox.showinfo("Processing Complete", 
-                              f"Processed {len(self.uploaded_images)} images\n"
-                              f"Successfully extracted: {processed_count} faces\n"
-                              f"Failed: {failed_count} images\n"
-                              f"Quality threshold: {self.quality_var.get():.2f}")
-            
-            self.status_label.config(text=f"Status: Processed {processed_count} faces from images", foreground='green')
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to process images: {str(e)}")
-    
-    def _calculate_image_quality(self, face_image):
-        """Calculate quality score for face image"""
-        try:
-            height, width = face_image.shape[:2]
-            
-            # Size check
-            if width < 100 or height < 100:
-                return 0.0
-            
-            # Convert to grayscale for analysis
-            gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
-            
-            # Brightness check
-            brightness = np.mean(gray)
-            if brightness < 50 or brightness > 200:
-                return 0.3
-            
-            # Contrast check
-            contrast = np.std(gray)
-            if contrast < 20:
-                return 0.4
-            
-            # Blur check
-            blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-            if blur_score < 100:
-                return 0.5
-            
-            # Calculate overall quality score
-            size_score = min(1.0, (width * height) / (200 * 200))
-            brightness_score = 1.0 - abs(brightness - 128) / 128
-            contrast_score = min(1.0, contrast / 50)
-            blur_score_normalized = min(1.0, blur_score / 500)
-            
-            overall_score = (size_score + brightness_score + contrast_score + blur_score_normalized) / 4
-            
-            return overall_score
-            
-        except Exception as e:
-            print(f"Error calculating image quality: {e}")
-            return 0.0
+            messagebox.showerror("Error", f"An error occurred during face capture: {str(e)}")
     
     def _update_captured_faces_display(self):
-        """Update the captured faces display"""
-        try:
-            # Clear existing display
-            for widget in self.scrollable_frame.winfo_children():
-                widget.destroy()
+        """Update the display of captured faces"""
+        # Clear existing faces
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        
+        # Add new faces
+        for i, face_data in enumerate(self.captured_faces):
+            face_img = face_data['image']
+            if face_img.shape[2] == 3:  # Check if it's a color image
+                face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
             
-            # Add captured faces
-            for i, face_data in enumerate(self.captured_faces):
-                face_frame = ttk.Frame(self.scrollable_frame)
-                face_frame.pack(fill=tk.X, pady=2)
-                
-                # Face thumbnail
-                face_image = face_data['image']
-                face_image_rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
-                face_image_pil = Image.fromarray(face_image_rgb)
-                face_image_pil.thumbnail((60, 60), Image.Resampling.LANCZOS)
-                face_image_tk = ImageTk.PhotoImage(face_image_pil)
-                
-                face_label = ttk.Label(face_frame, image=face_image_tk)
-                face_label.image = face_image_tk
-                face_label.pack(side=tk.LEFT, padx=(0, 10))
-                
-                # Face info
-                source = face_data['source']
-                quality_score = face_data['quality_metrics'].get('quality_score', 0.0)
-                info_text = f"Face {i+1} ({source})\nConfidence: {face_data['confidence']:.2f}\nQuality: {quality_score:.2f}"
-                info_label = ttk.Label(face_frame, text=info_text, justify=tk.LEFT)
-                info_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                
-                # Remove button
-                remove_btn = ttk.Button(face_frame, text="Remove", 
-                                      command=lambda idx=i: self._remove_face(idx))
-                remove_btn.pack(side=tk.RIGHT)
-                
-        except Exception as e:
-            print(f"Error updating captured faces display: {e}")
-    
-    def _remove_face(self, index: int):
-        """Remove a captured face"""
-        try:
-            if 0 <= index < len(self.captured_faces):
-                del self.captured_faces[index]
-                self._update_captured_faces_display()
-        except Exception as e:
-            print(f"Error removing face: {e}")
+            img = Image.fromarray(face_img)
+            img.thumbnail((100, 100))
+            photo = ImageTk.PhotoImage(img)
+            
+            face_label = ttk.Label(self.scrollable_frame, image=photo, 
+                                 text=f"Face {i+1}", compound=tk.TOP)
+            face_label.image = photo
+            face_label.pack(side=tk.LEFT, padx=5, pady=5)
     
     def _clear_faces(self):
         """Clear all captured faces"""
-        try:
-            self.captured_faces.clear()
-            self._update_captured_faces_display()
-        except Exception as e:
-            print(f"Error clearing faces: {e}")
+        self.captured_faces = []
+        self._update_captured_faces_display()
     
     def _debug_camera(self):
-        """Debug camera functionality"""
-        try:
+        """Show camera debug information"""
+        if self.camera_manager.is_camera_available():
             info = self.camera_manager.get_camera_info()
-            debug_text = f"Camera Debug Info:\n"
-            debug_text += f"Available: {self.camera_manager.is_camera_available()}\n"
-            debug_text += f"Camera Info: {info}\n"
-            debug_text += f"Registration Mode: {self.registration_mode}\n"
-            debug_text += f"Current Embedder: {self.current_embedder}\n"
-            debug_text += f"Captured Faces: {len(self.captured_faces)}\n"
+            messagebox.showinfo("Camera Debug Info", json.dumps(info, indent=2))
+        else:
+            messagebox.showwarning("Warning", "Camera not available")
+    
+    def _select_images(self):
+        """Select high-quality images for registration"""
+        filepaths = filedialog.askopenfilenames(
+            title="Select High-Quality Images",
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png"), ("All files", "*.*")]
+        )
+        if filepaths:
+            self.uploaded_images = list(filepaths)
+            self.image_listbox.delete(0, tk.END)
+            for path in self.uploaded_images:
+                self.image_listbox.insert(tk.END, os.path.basename(path))
+            self.process_btn.config(state=tk.NORMAL)
+    
+    def _preview_selected_image(self, event=None):
+        """Preview the selected image in the listbox"""
+        selection = self.image_listbox.curselection()
+        if not selection:
+            return
+        
+        index = selection[0]
+        image_path = self.uploaded_images[index]
+        
+        try:
+            img = Image.open(image_path)
+            img.thumbnail((500, 400))
+            photo = ImageTk.PhotoImage(img)
             
-            messagebox.showinfo("Camera Debug", debug_text)
-            
+            self.display_canvas.delete('all')
+            self.display_canvas.create_image(250, 200, image=photo, anchor=tk.CENTER)
+            self.display_canvas.image = photo
         except Exception as e:
-            messagebox.showerror("Debug Error", f"Debug failed: {str(e)}")
+            self.display_canvas.delete('all')
+            self.display_canvas.create_text(250, 200, text=f"Error previewing image:\n{e}",
+                                           fill='red', font=('Arial', 12))
+    
+    def _process_uploaded_images(self):
+        """Process uploaded images to extract face embeddings"""
+        if not self.uploaded_images:
+            messagebox.showwarning("Warning", "No images selected")
+            return
+        
+        self.captured_faces = []
+        
+        for image_path in self.uploaded_images:
+            try:
+                img = cv2.imread(image_path)
+                if img is None:
+                    continue
+                
+                # Use InsightFace for processing uploaded images
+                embedder = self.embedders['insightface']
+                results = embedder.detect_and_encode_faces(img)
+                
+                for x, y, w, h, confidence, embedding in results:
+                    face_region = self.face_detector.extract_face_region(img, (x, y, w, h))
+                    
+                    self.captured_faces.append({
+                        "image": face_region,
+                        "embedding": embedding,
+                        "quality": {"confidence": confidence},
+                        "embedder": "insightface"
+                    })
+            except Exception as e:
+                print(f"Error processing image {image_path}: {e}")
+        
+        self._update_captured_faces_display()
+        messagebox.showinfo("Info", f"Processed {len(self.uploaded_images)} images, found {len(self.captured_faces)} faces.")
     
     def _register_student(self):
-        """Register the student with captured faces"""
+        """Register student with captured faces"""
+        student_id = self.student_id_var.get().strip()
+        name = self.name_var.get().strip()
+        
+        if not student_id or not name:
+            messagebox.showerror("Error", "Student ID and Full Name are required")
+            return
+        
+        if not self.captured_faces:
+            messagebox.showerror("Error", "No faces captured for registration")
+            return
+        
         try:
-            # Validate form data
-            if not self.student_id_var.get().strip():
-                messagebox.showerror("Error", "Student ID is required")
-                return
+            # Add student to database
+            self.database_manager.add_student(
+                student_id=student_id,
+                name=name,
+                email=self.email_var.get().strip(),
+                phone=self.phone_var.get().strip(),
+                department=self.department_var.get(),
+                year=self.year_var.get()
+            )
             
-            if not self.name_var.get().strip():
-                messagebox.showerror("Error", "Name is required")
-                return
+            # Add face encodings
+            encodings = [face['embedding'] for face in self.captured_faces]
+            embedder_types = [face['embedder'] for face in self.captured_faces]
             
-            if not self.captured_faces:
-                messagebox.showerror("Error", "At least one face capture is required")
-                return
+            # For simplicity, assume all captured faces have same embedder type
+            # In a more complex scenario, this might need to be handled per-encoding
+            embedder_type = embedder_types[0] if embedder_types else 'unknown'
             
-            # Check if student already exists
-            existing_student = self.database_manager.get_student(self.student_id_var.get().strip())
-            if existing_student:
-                if not messagebox.askyesno("Student Exists", 
-                                         f"Student ID {self.student_id_var.get()} already exists. Update existing record?"):
-                    return
+            # Save one of the captured images for reference
+            # In a real application, you might want to save all or the best one
+            image_path = None
+            if self.captured_faces:
+                try:
+                    save_dir = "face_data"
+                    os.makedirs(save_dir, exist_ok=True)
+                    
+                    # Use the first captured face image
+                    face_img_to_save = self.captured_faces[0]['image']
+                    if face_img_to_save.shape[2] == 3:
+                        face_img_to_save = cv2.cvtColor(face_img_to_save, cv2.COLOR_RGB2BGR)
+                    
+                    filename = f"{student_id}_{int(time.time() * 1000)}.jpg"
+                    image_path = os.path.join(save_dir, filename)
+                    cv2.imwrite(image_path, face_img_to_save)
+                except Exception as e:
+                    print(f"Error saving face image: {e}")
             
-            # Prepare student data
-            student_data = {
-                'student_id': self.student_id_var.get().strip(),
-                'name': self.name_var.get().strip(),
-                'email': self.email_var.get().strip() or None,
-                'phone': self.phone_var.get().strip() or None,
-                'department': self.department_var.get().strip() or None,
-                'year': self.year_var.get().strip() or None
-            }
+            self.database_manager.add_face_encoding(
+                student_id=student_id,
+                encoding=encodings[0],  # For now, add first encoding
+                encoding_type=embedder_type,
+                image_path=image_path
+            )
             
-            # Add/Update student
-            if existing_student:
-                success = self.database_manager.update_student(student_data['student_id'], student_data)
-                if not success:
-                    messagebox.showerror("Error", "Failed to update student record")
-                    return
-            else:
-                success = self.database_manager.add_student(student_data)
-                if not success:
-                    messagebox.showerror("Error", "Failed to add student record")
-                    return
-            
-            # Save face images and add face encodings
-            success_count = 0
-            face_data_dir = self.config.get('face_data_path', 'face_data')
-            os.makedirs(face_data_dir, exist_ok=True)
-            
-            embedder_type = self.current_embedder
-            
-            # Process face captures
-            for i, face_data in enumerate(self.captured_faces):
-                # Generate unique filename
-                timestamp = int(time.time() * 1000) + i
-                face_filename = f"{student_data['student_id']}_{timestamp}.jpg"
-                face_filepath = os.path.join(face_data_dir, face_filename)
+            # Attempt to update FAISS index
+            try:
+                faiss_path = os.path.join('data', 'faiss')
+                fi = FaissIndex()
+                if os.path.exists(faiss_path + '.meta.json'):
+                    fi.load(faiss_path)
                 
-                # Save face image
-                cv2.imwrite(face_filepath, face_data['image'])
+                new_embeddings = np.array(encodings, dtype=np.float32)
+                new_names = [student_id] * len(encodings)
                 
-                # Add face encoding
-                success = self.database_manager.add_face_encoding(
-                    student_data['student_id'],
-                    face_data['embedding'],
-                    embedder_type,
-                    face_filepath
-                )
-                if success:
-                    success_count += 1
-                    # Add to FAISS index if available
-                    try:
-                        fi = FaissIndex()
-                        base = os.path.join('data', 'faiss')
-                        if os.path.exists(base + '.pkl') or os.path.exists(base + '.index'):
-                            fi.load(base)
-                        # add this embedding
-                        emb = face_data['embedding'].astype('float32')
-                        fi.add(emb.reshape(1, -1), [student_data['student_id']])
-                        fi.save(base)
-                    except Exception as e:
-                        # Non-fatal: log and continue
-                        logging.getLogger(__name__).warning(f"FAISS update failed for {student_data['student_id']}: {e}")
+                fi.add(new_embeddings, new_names)
+                fi.save(faiss_path)
+                
+            except Exception as e:
+                logging.warning(f"FAISS update failed for {student_id}: {e}")
             
-            if success_count > 0:
-                messagebox.showinfo("Success", 
-                                  f"Student registered successfully!\n"
-                                  f"Added {success_count} face encodings\n"
-                                  f"Encoder: {embedder_type}\n"
-                                  f"Mode: {self.registration_mode}")
-                self._cancel()
-            else:
-                messagebox.showerror("Error", "Failed to add face encodings")
-                
+            messagebox.showinfo("Success", f"Student {name} ({student_id}) registered successfully")
+            self._cancel()
+            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to register student: {str(e)}")
     
     def _cancel(self):
         """Cancel registration and close dialog"""
-        try:
-            self.camera_running = False
-            
-            # Only release camera if we created our own (not shared)
-            if not self.using_shared_camera:
-                self.camera_manager.release()
-                print("Released camera manager for registration")
-            else:
-                print("Keeping shared camera manager active")
-                
-            self.dialog.destroy()
-        except Exception as e:
-            print(f"Error closing dialog: {e}")
+        self.camera_running = False
+        if not self.using_shared_camera:
+            self.camera_manager.release()
+            print("Released camera manager for registration")
+        else:
+            print("Keeping shared camera manager active")
+        self.dialog.destroy()
     
     def _center_dialog(self):
         """Center the dialog on the parent window"""
-        try:
-            self.dialog.update_idletasks()
-            width = self.dialog.winfo_width()
-            height = self.dialog.winfo_height()
-            x = (self.dialog.winfo_screenwidth() // 2) - (width // 2)
-            y = (self.dialog.winfo_screenheight() // 2) - (height // 2)
-            self.dialog.geometry(f'{width}x{height}+{x}+{y}')
-        except:
-            pass
+        self.dialog.update_idletasks()
+        parent_x = self.parent.winfo_x()
+        parent_y = self.parent.winfo_y()
+        parent_width = self.parent.winfo_width()
+        parent_height = self.parent.winfo_height()
+        
+        dialog_width = self.dialog.winfo_width()
+        dialog_height = self.dialog.winfo_height()
+        
+        x = parent_x + (parent_width - dialog_width) // 2
+        y = parent_y + (parent_height - dialog_height) // 2
+        
+        self.dialog.geometry(f"+{x}+{y}")

@@ -84,7 +84,8 @@ class DualPipeline:
         self.last_update_time = 0
         # Attempt to load FAISS index if present
         try:
-            self.faiss_index = FaissIndex()
+            # Initialize FaissIndex with the dimension of the chosen embedder
+            self.faiss_index = FaissIndex(dim=self.face_embedder.embedding_size)
             self.faiss_index.load(os.path.join('data', 'faiss'))
             if self.faiss_index.dim is None:
                 self.faiss_index = None
